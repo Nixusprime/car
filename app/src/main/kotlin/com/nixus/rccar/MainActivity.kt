@@ -108,8 +108,34 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
 
     // ------------------------------------------------------------------ lifecycle
 
+    /** Saves the stack trace of a crash so the next launch can show it on screen. */
+    private fun installCrashCatcher() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                getSharedPreferences("rc", MODE_PRIVATE).edit().putString("crash", sw.toString()).commit()
+            } catch (ignored: Exception) {
+            }
+            previous?.uncaughtException(t, e)
+        }
+    }
+
+    private fun showLastCrash() {
+        val prefs = getSharedPreferences("rc", MODE_PRIVATE)
+        val trace = prefs.getString("crash", null) ?: return
+        prefs.edit().remove("crash").apply()
+        AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+            .setTitle("The app crashed last time")
+            .setMessage(trace.take(1800))
+            .setPositiveButton("Close") { _, _ -> }
+            .show()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installCrashCatcher()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (Build.VERSION.SDK_INT >= 28) {
             val attrs = window.attributes
@@ -118,6 +144,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         }
         sensors = getSystemService(SENSOR_SERVICE) as SensorManager
         buildUi()
+        showLastCrash()
         ui.postDelayed({ autoConnect() }, 400)
     }
 
@@ -604,7 +631,6 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     @SuppressLint("MissingPermission")
     private fun connectTo(device: BluetoothDevice) {
         getSharedPreferences("rc", MODE_PRIVATE).edit().putString("last", device.address).apply()
-        adapter()?.cancelDiscovery()
         link.connect(device)
     }
 
