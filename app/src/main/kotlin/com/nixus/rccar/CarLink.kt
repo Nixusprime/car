@@ -150,10 +150,14 @@ class CarLink(private val listener: Listener) {
             socket = sock
             lock.withLock { pending.clear() }
             listener.onState(State.CONNECTED, device.name ?: device.address)
-            val input = sock.inputStream
-            val output = sock.outputStream
-            Thread { readLoop(my, input) }.start()
-            sendLoop(my, output)
+            try {
+                val input = sock.inputStream
+                val output = sock.outputStream
+                Thread { readLoop(my, input) }.start()
+                sendLoop(my, output)
+            } catch (e: Exception) {
+                fail(my, "Connection lost")
+            }
         }.start()
     }
 
