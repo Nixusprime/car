@@ -31,7 +31,10 @@
     R,<ms>                 ramp time to full throttle in ms (0 = instant / launch mode)
     S,<0|1>                gyro stability assist on/off
     G,<0|1>                straight-line heading hold on/off
-    Z                      recalibrate gyro (car must be stationary)
+    Z                      re-zero gyro drift and yaw (car must be stationary)
+    C,<1|0>                1 = level the tilt readings and zero the gyro, saved to EEPROM (car still, on a flat surface)
+                           0 = clear the saved level trim
+    N                      flip the yaw direction (saved to EEPROM)
     P                      ping (heartbeat only)
   Car -> app (about 4 lines per second each):
     S,<distCenter>,<distLeft>,<distRight>,<driveMode>,<autoMode>,<flags>
@@ -41,6 +44,12 @@
 
   START-UP SELF-TEST (headlight flashes): one long flash = all good.
     2 short = IMU not found, 3 short = a sonar saw no echo, 4 short = battery voltage odd.
+
+  BATTERY SENSE (optional, HAS_BATT_SENSE)
+   The HX-2S-D20 BMS has no signal wire, so the Arduino cannot read it. To show the battery voltage,
+   wire pack + (after the power switch) -> 10k -> A6 -> 10k -> GND, then set HAS_BATT_SENSE to 1.
+   A full 2S pack (8.4 V) gives 4.2 V at A6. Do NOT set it to 1 with nothing on A6: a floating pin
+   makes the car think the battery is dead (cutoff, throttle blocked, warning beeps).
 
   NOTES
    - There is no rear sensor, so reversing (including the Roam back-up) is not protected.
@@ -53,6 +62,7 @@
 */
 
 #include <Wire.h>
+#include <EEPROM.h>
 #include <Servo.h>
 #include <SoftwareSerial.h>
 #include <math.h>
@@ -67,6 +77,9 @@
 #define HAS_BUZZER       1     // active buzzer wired to D12 (0 = no buzzer)
 #define BUZZER_ACTIVE_LOW 0    // 1 if your buzzer module is "low-level trigger" (beeps when I/O is LOW).
                                // If it buzzes constantly after power-up, set this to 1.
+#define HAS_BATT_SENSE   0     // 1 = two 10k resistors wired from the pack + to A6 and from A6 to GND (see header).
+                               // 0 = nothing on A6: battery readout, limp mode and cutoff are all switched off.
+                               // Leaving A6 unwired with this set to 1 makes the car think the battery is dead.
 const long BT_BAUD = 9600;     // 38400 is smoother if you set the HC-05 with AT+UART=38400,0,0
 
 // Motor wiring tweaks
@@ -76,7 +89,7 @@ const bool INVERT_RIGHT  = false;
 const int8_t SERVO_DIR   = 1;      // -1 if "steer right" turns the car left
 const uint8_t SERVO_CENTER = 90;   // adjust to trim steering
 const uint8_t SERVO_RANGE  = 35;   // degrees each side (55..125). Do not exceed what the linkage allows
-const int8_t GYRO_SIGN   = 1;      // -1 if positive yaw is not a left turn
+const int8_t GYRO_SIGN   = 1;      // start value only. Flip it from the app (Calibrate > Flip yaw direction), it is saved in EEPROM
 
 // =====================================================================
 //  PINS
@@ -188,6 +201,8 @@ const unsigned long SONAR_GAP_US = 3000, SONAR_RISE_TIMEOUT_US = 6000, SONAR_FAL
 // IMU
 bool imuOk = false;
 float roll = 0, pitch = 0, yawDeg = 0, gyroZ = 0, gyroBiasZ = 0, gMag = 1.0f;
+float rollTrim = 0, pitchTrim = 0;      // how far from level the board sits on the chassis (saved in EEPROM)
+int8_t gyroSign = GYRO_SIGN;            // saved in EEPROM
 unsigned long lastImuUs = 0, tiltStart = 0;
 uint8_t crashCount = 0;
 
@@ -357,14 +372,50 @@ bool imuReadRaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gz) {
   return true;
 }
 
-void imuCalibrate() {
-  float sum = 0; int n = 0;
+// ---- saved calibration (EEPROM) ----
+struct CalData { uint8_t magic; int16_t rollX100; int16_t pitchX100; int8_t sign; };
+const uint8_t CAL_MAGIC = 0xA7;
+
+void saveCal() {
+  CalData c;
+  c.magic = CAL_MAGIC;
+  c.rollX100 = (int16_t)(rollTrim * 100.0f);
+  c.pitchX100 = (int16_t)(pitchTrim * 100.0f);
+  c.sign = gyroSign;
+  EEPROM.put(0, c);                                // only writes bytes that changed
+}
+
+void loadCal() {
+  CalData c;
+  EEPROM.get(0, c);
+  if (c.magic != CAL_MAGIC || (c.sign != 1 && c.sign != -1)) return;
+  rollTrim = c.rollX100 / 100.0f;
+  pitchTrim = c.pitchX100 / 100.0f;
+  gyroSign = c.sign;
+}
+
+// Gyro zero (always) and, when level is true, the board's tilt trim. The car must be still.
+// The level step is skipped if the surface is tilted more than 25 degrees (or the car is upside down).
+void imuCalibrate(bool level) {
+  float sumG = 0, sumX = 0, sumY = 0, sumZ = 0; int n = 0;
   for (int i = 0; i < 200; i++) {
     int16_t ax, ay, az, gz;
-    if (imuReadRaw(ax, ay, az, gz)) { sum += gz / 65.5f; n++; }
+    if (imuReadRaw(ax, ay, az, gz)) {
+      sumG += gz / 65.5f;
+      sumX += ax; sumY += ay; sumZ += az;
+      n++;
+    }
     delay(5);
   }
-  if (n > 50) gyroBiasZ = sum / n;
+  if (n > 50) {
+    gyroBiasZ = sumG / n;
+    if (level) {
+      float fx = sumX / n / 8192.0f, fy = sumY / n / 8192.0f, fz = sumZ / n / 8192.0f;
+      float r = atan2(fy, fz) * 57.2958f;
+      float p = atan2(-fx, sqrt(fy * fy + fz * fz)) * 57.2958f;
+      if (fabs(r) < 25.0f && fabs(p) < 25.0f) { rollTrim = r; pitchTrim = p; saveCal(); }
+    }
+  }
   yawDeg = 0; hhActive = false;
 }
 
@@ -382,7 +433,7 @@ bool imuInit() {
   mpuWrite(0x1B, 0x08);                            // gyro +-500 dps
   mpuWrite(0x1C, 0x08);                            // accel +-4 g
   mpuWrite(0x1D, 0x02);                            // accel low-pass ~99 Hz
-  imuCalibrate();
+  imuCalibrate(false);                             // gyro zero only; the level trim comes from EEPROM
   lastImuUs = micros();
   return true;
 }
@@ -398,10 +449,10 @@ void imuUpdate() {
 
   float fx = ax / 8192.0f, fy = ay / 8192.0f, fz = az / 8192.0f;
   float rawZ = gz / 65.5f - gyroBiasZ;
-  gyroZ = GYRO_SIGN * rawZ;
+  gyroZ = gyroSign * rawZ;
   yawDeg += gyroZ * dt;
-  roll  = atan2(fy, fz) * 57.2958f;
-  pitch = atan2(-fx, sqrt(fy * fy + fz * fz)) * 57.2958f;
+  roll  = atan2(fy, fz) * 57.2958f - rollTrim;
+  pitch = atan2(-fx, sqrt(fy * fy + fz * fz)) * 57.2958f - pitchTrim;
   gMag  = sqrt(fx * fx + fy * fy + fz * fz);
 
   // slowly learn the gyro bias while the car sits still
@@ -435,6 +486,10 @@ void imuUpdate() {
 //  BATTERY
 // =====================================================================
 void batteryUpdate() {
+#if !HAS_BATT_SENSE
+  battV = 0; battValid = false; limp = false; cutoff = false;   // nothing wired to A6
+  return;
+#endif
   float raw = analogRead(PIN_BATT);
   float v = (raw / 1023.0f) * V_REF * ((R1 + R2) / R2) * BATT_CAL;
   battV = (battV <= 0.1f) ? v : battV * 0.9f + v * 0.1f;
@@ -657,7 +712,13 @@ void handleLine(char *line) {
     case 'R': rampMs = (uint16_t)(a < 0 ? 0 : (a > 3000 ? 3000 : a)); break;
     case 'S': stabAssist = (a != 0); break;
     case 'G': headingHold = (a != 0); hhActive = false; break;
-    case 'Z': if (speedCur == 0 && imuOk) imuCalibrate(); break;
+    case 'Z': if (speedCur == 0 && imuOk) imuCalibrate(false); break;
+    case 'C':
+      if (strchr(line, ',') == NULL) break;                            // ignore a damaged "C" with no value
+      if (a == 0) { rollTrim = 0; pitchTrim = 0; saveCal(); }          // C,0 clears the saved level trim
+      else if (speedCur == 0 && imuOk) imuCalibrate(true);             // C,1 level + gyro zero, saved
+      break;
+    case 'N': gyroSign = -gyroSign; yawDeg = 0; hhActive = false; saveCal(); break;   // flip yaw direction
     case 'P': break;
     default: known = false; break;
   }
@@ -767,6 +828,7 @@ void selfTest() {
 void setup() {
   DBG_BEGIN();
   BTPORT.begin(BT_BAUD);
+  loadCal();
 
   pinMode(PIN_MOTOR_L_A, OUTPUT); pinMode(PIN_MOTOR_L_B, OUTPUT);
   pinMode(PIN_MOTOR_R_A, OUTPUT); pinMode(PIN_MOTOR_R_B, OUTPUT);
