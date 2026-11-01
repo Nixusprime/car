@@ -450,7 +450,10 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         }
         throttlePad.onBrake = { b ->
             padBrake = b
-            if (b) holdArmed = false      // braking ends cruise
+            if (b) {
+                holdArmed = false         // braking ends cruise
+                curThrottle = 0
+            }
             pushDrive()
         }
 

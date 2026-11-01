@@ -25,7 +25,16 @@ data class Telemetry(
     val yaw: Int = 0,
     val gForce: Float = 1f,
     val battV: Float = 0f,
-    val speed: Int = 0
+    val speed: Int = 0,
+    // motion line (M): what the car works out from its gyro and sonar
+    val vOwn: Int = 0,          // own speed, cm/s
+    val vClose: Int = 0,        // closing speed on what is ahead, cm/s
+    val yawAct: Int = 0,        // measured turn rate, deg/s
+    val yawExp: Int = 0,        // turn rate the steering should give, deg/s
+    val slope: Float = 0f,      // + = nose up, degrees
+    val cap: Int = 100,         // speed limit set by the collision system, %
+    val calState: Int = 0,      // motion calibration: 0 idle, 1 running, 2 done, 3 no wall, 4 aborted, 5 odd result
+    val fwdKnown: Boolean = false
 )
 
 /**
@@ -57,6 +66,7 @@ class CarLink(private val listener: Listener) {
     @Volatile private var socket: BluetoothSocket? = null
     @Volatile private var throttle = 0
     @Volatile private var steer = 0
+    @Volatile private var brake = false
 
     private val lock = ReentrantLock()
     private val wake = lock.newCondition()
@@ -66,11 +76,12 @@ class CarLink(private val listener: Listener) {
 
     val isConnected: Boolean get() = socket != null
 
-    /** Latest stick positions, -100..100. Cheap to call as often as you like. */
-    fun setDrive(t: Int, s: Int) {
-        if (t == throttle && s == steer) return
+    /** Latest stick positions, -100..100, and whether the full brake is held. Cheap to call as often as you like. */
+    fun setDrive(t: Int, s: Int, b: Boolean = false) {
+        if (t == throttle && s == steer && b == brake) return
         throttle = t
         steer = s
+        brake = b
         lock.withLock {
             dirty = true
             wake.signalAll()
@@ -104,10 +115,11 @@ class CarLink(private val listener: Listener) {
     /** Best effort: tell the car to stop right now, even from the UI thread. */
     fun emergencyStopNow() {
         throttle = 0
+        brake = false
         try {
             val out = socket?.outputStream
             if (out != null) {
-                out.write("X\nD,0,$steer\n".toByteArray(Charsets.US_ASCII))
+                out.write("X\nD,0,$steer,0\n".toByteArray(Charsets.US_ASCII))
                 out.flush()
             }
         } catch (e: Exception) {
@@ -200,7 +212,7 @@ class CarLink(private val listener: Listener) {
                 if (gap > 0) Thread.sleep(gap)
                 val sb = StringBuilder()
                 for (c in cmds) sb.append(c).append('\n')
-                sb.append("D,").append(throttle).append(',').append(steer).append('\n')
+                sb.append("D,").append(throttle).append(',').append(steer).append(',').append(if (brake) 1 else 0).append('\n')
                 out.write(sb.toString().toByteArray(Charsets.US_ASCII))
                 out.flush()
                 lastSend = SystemClock.elapsedRealtime()
@@ -251,6 +263,12 @@ class CarLink(private val listener: Listener) {
                 return prev.copy(
                     roll = p[1].toInt(), pitch = p[2].toInt(), yaw = p[3].toInt(),
                     gForce = p[4].toInt() / 10f, battV = p[5].toInt() / 100f, speed = p[6].toInt()
+                )
+            }
+            if (p.size >= 9 && p[0] == "M") {
+                return prev.copy(
+                    vOwn = p[1].toInt(), vClose = p[2].toInt(), yawAct = p[3].toInt(), yawExp = p[4].toInt(),
+                    slope = p[5].toInt() / 10f, cap = p[6].toInt(), calState = p[7].toInt(), fwdKnown = p[8].trim() != "0"
                 )
             }
         } catch (e: NumberFormatException) {

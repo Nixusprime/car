@@ -22,20 +22,29 @@ class SonarView(context: Context) : View(context) {
     private val dm = resources.displayMetrics.density
     private val rect = RectF()
 
-    private val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF171B22.toInt() }
+    private val cardPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF1A1D20.toInt() }
     private val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = 0xFF2A303B.toInt()
+        color = 0xFF2C3034.toInt()
         style = Paint.Style.STROKE
         strokeWidth = 1f * dm
     }
-    private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF3A4252.toInt() }
-    private val wheelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF0E1116.toInt() }
+    private val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF3A4048.toInt() }
+    private val wheelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF0E1012.toInt() }
     private val beamPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 5f * dm }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         textAlign = Paint.Align.CENTER
         textSize = 12f * dm
     }
+
+    /** Tint the outline: 0 = normal, otherwise the colour of the active warning (braking, speed limited...). */
+    fun setEdge(color: Int) {
+        if (color == edgeColor) return
+        edgeColor = color
+        invalidate()
+    }
+
+    private var edgeColor = 0
 
     fun setData(c: Int, l: Int, r: Int, isLive: Boolean) {
         if (c == distC && l == distL && r == distR && isLive == live) return
@@ -47,9 +56,9 @@ class SonarView(context: Context) : View(context) {
     }
 
     private fun colorFor(d: Int): Int = when {
-        d < 20 -> 0xFFEF4444.toInt()
-        d < 40 -> 0xFFF59E0B.toInt()
-        else -> 0xFF22C55E.toInt()
+        d < 20 -> 0xFFEF4B3F.toInt()
+        d < 40 -> 0xFFF2C230.toInt()
+        else -> 0xFF35C46A.toInt()
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -59,6 +68,8 @@ class SonarView(context: Context) : View(context) {
         rect.set(0f, 0f, w, h)
         canvas.drawRoundRect(rect, 14f * dm, 14f * dm, cardPaint)
         rect.set(1f, 1f, w - 1f, h - 1f)
+        edgePaint.color = if (edgeColor != 0) edgeColor else 0xFF2C3034.toInt()
+        edgePaint.strokeWidth = (if (edgeColor != 0) 2.5f else 1f) * dm
         canvas.drawRoundRect(rect, 14f * dm, 14f * dm, edgePaint)
 
         // the car, nose up, near the bottom
@@ -107,12 +118,12 @@ class SonarView(context: Context) : View(context) {
         }
         val x1 = x0 + dirX * sinA * len
         val y1 = y0 - cosA * len
-        val color = if (!live) 0xFF3A4252.toInt() else colorFor(dist)
+        val color = if (!live) 0xFF3A4048.toInt() else colorFor(dist)
         beamPaint.color = color
         canvas.drawLine(x0, y0, x1, y1, beamPaint)
         dotPaint.color = color
         canvas.drawCircle(x1, y1, 5f * dm, dotPaint)
-        textPaint.color = if (live) color else 0xFF8A93A3.toInt()
+        textPaint.color = if (live) color else 0xFF8C9096.toInt()
         val label = if (!live) "-" else if (clear) "clear" else "$dist cm"
         val lx = min(max(x1, 30f * dm), w - 30f * dm)
         canvas.drawText(label, lx, y1 - 9f * dm, textPaint)
