@@ -9,6 +9,7 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -35,15 +36,21 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
 
-private val BG = 0xFF0E1116.toInt()
-private val CARD = 0xFF171B22.toInt()
-private val BORDER = 0xFF2A303B.toInt()
-private val TEXT = 0xFFE6EAF0.toInt()
-private val MUTED = 0xFF8A93A3.toInt()
-private val ACCENT = 0xFF3B82F6.toInt()
-private val GOOD = 0xFF22C55E.toInt()
-private val WARN = 0xFFF59E0B.toInt()
-private val BAD = 0xFFEF4444.toInt()
+// Colours follow the car's own jumper wires: green throttle, yellow steering, red brake,
+// orange lights, blue assists, purple autonomy, on a neutral graphite background.
+private val BG = 0xFF111315.toInt()
+private val CARD = 0xFF1A1D20.toInt()
+private val BORDER = 0xFF2C3034.toInt()
+private val TEXT = 0xFFECEAE6.toInt()
+private val MUTED = 0xFF8C9096.toInt()
+private val DARK = 0xFF0B0D0E.toInt()
+private val THROTTLE = 0xFF35C46A.toInt()
+private val STEER = 0xFFF2C230.toInt()
+private val BRAKE = 0xFFEF4B3F.toInt()
+private val LIGHT = 0xFFFF8A2B.toInt()
+private val ASSIST = 0xFF4C8DFF.toInt()
+private val AUTO = 0xFFA77BFF.toInt()
+private val NEUTRAL = 0xFFB8BDC4.toInt()
 
 private const val FLAG_LINK_LOST = 1
 private const val FLAG_LIMP = 2
@@ -54,6 +61,13 @@ private const val FLAG_CRASH = 32
 private const val FLAG_HOLD = 64
 private const val FLAG_STAB = 128
 private const val FLAG_HEADING = 256
+private const val FLAG_STUCK = 512
+private const val FLAG_EMERGENCY = 1024
+private const val FLAG_HARD_BRAKE = 2048
+private const val FLAG_LIMITED = 4096
+private const val FLAG_HILL = 8192
+private const val FLAG_DRIFT = 16384
+private const val FLAG_GAVE_UP = 32768
 
 private const val REQ_BT = 1
 private const val TILT_MAX_DEG = 40f
@@ -65,6 +79,10 @@ private const val THROTTLE_W_DP = 120
 private const val BOTTOM_ROW_DP = 52
 private const val DEFAULT_PAD_LEFT = 40
 private const val DEFAULT_STEER_RAISE = 8
+private const val DEFAULT_PAD_TRAVEL = 70
+private const val DEFAULT_STEER_RETURN = 500
+private const val DEFAULT_GAP = 100
+private const val ALL_ASSISTS = 127
 private val MODE_NAMES = arrayOf("Eco", "Normal", "Sport")
 private val AUTO_NAMES = arrayOf("Manual", "Roam", "Follow", "Corridor")
 
@@ -80,6 +98,8 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
 
     private var curThrottle = 0
     private var curSteer = 0
+    private var padBrake = false
+    private var btnBrake = false
     private var lightsOn = false
     private var hazardOn = false
     private var holdArmed = false
@@ -93,13 +113,17 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     private lateinit var sonarView: SonarView
     private lateinit var statusText: TextView
     private lateinit var connectChip: TextView
+    private lateinit var infoBtn: TextView
     private lateinit var alertText: TextView
     private lateinit var calInfo: TextView
+    private lateinit var motionInfo: TextView
+    private lateinit var diagText: TextView
     private lateinit var batteryM: Metric
     private lateinit var speedM: Metric
     private lateinit var tiltM: Metric
     private lateinit var modeChips: List<TextView>
     private lateinit var autoChips: List<TextView>
+    private lateinit var assistChips: List<Pair<TextView, Int>>
     private lateinit var modesBtn: TextView
     private lateinit var autoBtn: TextView
     private lateinit var assistBtn: TextView
@@ -111,11 +135,25 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     private lateinit var headingChip: TextView
     private lateinit var tiltChip: TextView
     private lateinit var tiltRevChip: TextView
+    private lateinit var brakeChip: TextView
     private lateinit var rampLabel: TextView
     private lateinit var rampSeek: SeekBar
     private lateinit var brightSeek: SeekBar
     private lateinit var padSeek: SeekBar
     private lateinit var raiseSeek: SeekBar
+    private lateinit var travelLabel: TextView
+    private lateinit var travelSeek: SeekBar
+    private lateinit var returnLabel: TextView
+    private lateinit var returnSeek: SeekBar
+    private lateinit var gapLabel: TextView
+    private lateinit var gapSeek: SeekBar
+    private lateinit var diffLabel: TextView
+    private lateinit var diffSeek: SeekBar
+    private var diffPct = 100
+    private var padTravel = DEFAULT_PAD_TRAVEL
+    private var steerReturn = DEFAULT_STEER_RETURN
+    private var gapPct = DEFAULT_GAP
+    private var assistMask = ALL_ASSISTS
     private lateinit var sensors: SensorManager
 
     // layout pieces whose margins the position sliders move
@@ -126,6 +164,8 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     private var padLeftDp = DEFAULT_PAD_LEFT
     private var steerRaiseDp = DEFAULT_STEER_RAISE
     private var popupDialog: AlertDialog? = null
+
+    private val lastStyle = HashMap<TextView, Int>()
 
     private class Metric(val root: LinearLayout, val value: TextView)
 
@@ -181,8 +221,10 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         ui.removeCallbacks(renderTask)
         sensors.unregisterListener(this)
         curThrottle = 0
+        padBrake = false
+        btnBrake = false
         throttlePad.setExternal(0)
-        link.setDrive(0, if (tiltOn) 0 else curSteer)
+        link.setDrive(0, if (tiltOn) 0 else curSteer, false)
         link.emergencyStopNow()
         super.onPause()
     }
@@ -211,31 +253,58 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    private fun styleChip(tv: TextView, on: Boolean, color: Int = ACCENT) {
+    private fun alpha(color: Int, a: Int): Int = (color and 0x00FFFFFF) or (a shl 24)
+
+    /**
+     * on = filled with the chip's colour; armed = outlined in it (ready but not active); otherwise a quiet
+     * card with a faint outline of its colour, so the colour coding is visible even when everything is off.
+     */
+    private fun styleChip(tv: TextView, on: Boolean, armed: Boolean = false) {
+        val key = (if (on) 1 else 0) or (if (armed) 2 else 0)
+        if (lastStyle[tv] == key) return
+        lastStyle[tv] = key
+        val accent = (tv.tag as? Int) ?: ACCENT_DEFAULT
         val g = GradientDrawable()
         g.cornerRadius = dp(10).toFloat()
-        g.setColor(if (on) color else CARD)
-        g.setStroke(dp(1), if (on) color else BORDER)
+        when {
+            on -> {
+                g.setColor(accent)
+                g.setStroke(dp(1), accent)
+                tv.setTextColor(DARK)
+            }
+            armed -> {
+                g.setColor(CARD)
+                g.setStroke(dp(2), accent)
+                tv.setTextColor(accent)
+            }
+            else -> {
+                g.setColor(CARD)
+                g.setStroke(dp(1), alpha(accent, 0x66))
+                tv.setTextColor(TEXT)
+            }
+        }
         tv.background = g
-        tv.setTextColor(if (on && color == WARN) 0xFF1A1200.toInt() else TEXT)
     }
 
-    private fun chip(label: String, size: Float = 13f, onClick: () -> Unit): TextView {
+    private val ACCENT_DEFAULT = ASSIST
+
+    private fun chip(label: String, accent: Int = NEUTRAL, size: Float = 13f, onClick: () -> Unit): TextView {
         val tv = TextView(this)
         tv.text = label
         tv.textSize = size
         tv.gravity = Gravity.CENTER
         tv.minHeight = dp(42)
         tv.setPadding(dp(6), dp(6), dp(6), dp(6))
+        tv.tag = accent
         tv.setOnClickListener { onClick() }
         styleChip(tv, false)
         return tv
     }
 
-    private fun metric(title: String): Metric {
+    private fun metric(title: String, valueSize: Float, condensed: Boolean): Metric {
         val box = LinearLayout(this)
         box.orientation = LinearLayout.VERTICAL
-        box.setPadding(dp(8), dp(5), dp(8), dp(5))
+        box.setPadding(dp(10), dp(4), dp(10), dp(4))
         val g = GradientDrawable()
         g.cornerRadius = dp(12).toFloat()
         g.setColor(CARD)
@@ -248,7 +317,8 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         val v = TextView(this)
         v.text = "-"
         v.setTextColor(TEXT)
-        v.textSize = 15f
+        v.textSize = valueSize
+        if (condensed) v.typeface = Typeface.create("sans-serif-condensed", Typeface.BOLD)
         box.addView(t)
         box.addView(v)
         return Metric(box, v)
@@ -260,12 +330,15 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         return v
     }
 
-    private fun row(vararg views: View): LinearLayout {
+    private fun row(vararg views: View): LinearLayout = rowW(floatArrayOf(), *views)
+
+    private fun rowW(weights: FloatArray, vararg views: View): LinearLayout {
         val r = LinearLayout(this)
         r.orientation = LinearLayout.HORIZONTAL
-        for (v in views) {
+        for ((i, v) in views.withIndex()) {
             detach(v)
-            val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            val w = if (i < weights.size) weights[i] else 1f
+            val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, w)
             lp.setMargins(dp(3), dp(3), dp(3), dp(3))
             r.addView(v, lp)
         }
@@ -290,9 +363,9 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         return t
     }
 
-    private fun seekColors(s: SeekBar) {
-        s.progressTintList = ColorStateList.valueOf(ACCENT)
-        s.thumbTintList = ColorStateList.valueOf(ACCENT)
+    private fun seekColors(s: SeekBar, color: Int = NEUTRAL) {
+        s.progressTintList = ColorStateList.valueOf(color)
+        s.thumbTintList = ColorStateList.valueOf(color)
     }
 
     private fun column(): LinearLayout {
@@ -325,14 +398,41 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
 
     private fun prefs() = getSharedPreferences("rc", MODE_PRIVATE)
 
+    /** One slider that remembers its value and sends it to the car when it moves. */
+    private fun slider(max: Int, start: Int, color: Int, onChange: (Int, Boolean) -> Unit, onDone: (Int) -> Unit): SeekBar {
+        val s = SeekBar(this)
+        s.max = max
+        s.progress = start
+        seekColors(s, color)
+        s.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) = onChange(p, fromUser)
+            override fun onStartTrackingTouch(sb: SeekBar) {}
+            override fun onStopTrackingTouch(sb: SeekBar) = onDone(sb.progress)
+        })
+        return s
+    }
+
     // ------------------------------------------------------------------ UI
 
     private fun buildUi() {
         padLeftDp = prefs().getInt("padLeft", DEFAULT_PAD_LEFT).coerceIn(0, 120)
         steerRaiseDp = prefs().getInt("steerRaise", DEFAULT_STEER_RAISE).coerceIn(0, 100)
+        diffPct = prefs().getInt("diffPct", 100).coerceIn(50, 150)
+        padTravel = prefs().getInt("padTravel", DEFAULT_PAD_TRAVEL).coerceIn(40, 110)
+        steerReturn = prefs().getInt("steerReturn", DEFAULT_STEER_RETURN).coerceIn(0, 1500)
+        gapPct = prefs().getInt("gapPct", DEFAULT_GAP).coerceIn(50, 200)
+        assistMask = prefs().getInt("assistMask", ALL_ASSISTS) and ALL_ASSISTS
 
+        // ---- pads
         throttlePad = AxisPad(this, true)
-        throttlePad.accent = GOOD
+        throttlePad.accent = THROTTLE
+        throttlePad.brakeColor = BRAKE
+        throttlePad.reverseColor = LIGHT
+        throttlePad.title = "Throttle"
+        throttlePad.hintMax = "forward"
+        throttlePad.hintMin = "reverse"
+        throttlePad.hintSide = "swipe left to brake"
+        throttlePad.travelDp = padTravel.toFloat()
         throttlePad.onValue = { v ->
             curThrottle = v
             pushDrive()
@@ -342,15 +442,24 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             if (down && (latest.flags and FLAG_HOLD) != 0) link.sendQueued("K,0")
         }
         throttlePad.onRelease = { last ->
-            if (holdArmed && last > 0 && latest.auto == 0) {
+            if (holdArmed && last > 0 && latest.auto == 0 && !padBrake) {
                 // lock the speed the car is doing right now, then let go of the pad
-                link.sendQueued("D,$last,$curSteer")
+                link.sendQueued("D,$last,$curSteer,0")
                 link.sendQueued("K,1")
             }
         }
+        throttlePad.onBrake = { b ->
+            padBrake = b
+            if (b) holdArmed = false      // braking ends cruise
+            pushDrive()
+        }
 
         steerPad = AxisPad(this, false)
-        steerPad.accent = ACCENT
+        steerPad.accent = STEER
+        steerPad.title = "Steering"
+        steerPad.hintMin = "left"
+        steerPad.hintMax = "right"
+        steerPad.travelDp = padTravel.toFloat()
         steerPad.onValue = { v ->
             if (!tiltOn) {
                 curSteer = v
@@ -358,12 +467,24 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             }
         }
 
-        // ---- status
+        // ---- status row: connect, message, information button
         statusText = TextView(this)
         statusText.setTextColor(TEXT)
         statusText.textSize = 13f
         statusText.gravity = Gravity.CENTER_VERTICAL
-        connectChip = chip("Connect", 12f) { onConnectClicked() }
+        connectChip = chip("Connect", NEUTRAL, 12f) { onConnectClicked() }
+        infoBtn = TextView(this)
+        infoBtn.text = "i"
+        infoBtn.textSize = 18f
+        infoBtn.typeface = Typeface.create(Typeface.SERIF, Typeface.BOLD_ITALIC)
+        infoBtn.gravity = Gravity.CENTER
+        infoBtn.setTextColor(TEXT)
+        val ig = GradientDrawable()
+        ig.shape = GradientDrawable.OVAL
+        ig.setColor(CARD)
+        ig.setStroke(dp(1), MUTED)
+        infoBtn.background = ig
+        infoBtn.setOnClickListener { showManual() }
         val statusRow = LinearLayout(this)
         statusRow.orientation = LinearLayout.HORIZONTAL
         statusRow.gravity = Gravity.CENTER_VERTICAL
@@ -371,10 +492,11 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         cl.setMargins(0, 0, dp(8), 0)
         statusRow.addView(connectChip, cl)
         statusRow.addView(statusText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        statusRow.addView(infoBtn, LinearLayout.LayoutParams(dp(36), dp(36)))
 
-        batteryM = metric("Battery")
-        speedM = metric("Speed")
-        tiltM = metric("Tilt")
+        speedM = metric("Speed %", 28f, true)
+        batteryM = metric("Battery", 15f, false)
+        tiltM = metric("Tilt", 15f, false)
         sonarView = SonarView(this)
 
         alertText = TextView(this)
@@ -388,9 +510,20 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         calInfo.textSize = 16f
         calInfo.setPadding(dp(4), dp(10), dp(4), dp(10))
 
+        motionInfo = TextView(this)
+        motionInfo.setTextColor(TEXT)
+        motionInfo.textSize = 13f
+        motionInfo.setPadding(dp(4), dp(6), dp(4), dp(6))
+
+        diagText = TextView(this)
+        diagText.setTextColor(TEXT)
+        diagText.textSize = 12.5f
+        diagText.typeface = Typeface.MONOSPACE
+        diagText.setPadding(dp(4), dp(8), dp(4), dp(8))
+
         // ---- mode and auto (live inside popups)
         modeChips = MODE_NAMES.mapIndexed { i, n ->
-            chip(n) {
+            chip(n, THROTTLE) {
                 link.sendQueued("M,$i")
                 val defaults = intArrayOf(600, 300, 150)
                 rampSeek.progress = defaults[i] / 50
@@ -398,38 +531,37 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             }
         }
         autoChips = AUTO_NAMES.mapIndexed { i, n ->
-            chip(n) {
+            chip(n, AUTO) {
                 link.sendQueued("A,$i")
                 closePopup()
             }
         }
 
         // ---- always-visible toggles
-        lightsChip = chip("Lights", 12f) {
+        lightsChip = chip("Lights", LIGHT, 12f) {
             lightsOn = !lightsOn
             link.sendQueued("L,${if (lightsOn) 1 else 0}")
             styleChip(lightsChip, lightsOn)
         }
-        hazardChip = chip("Hazard", 12f) {
+        hazardChip = chip("Hazard", LIGHT, 12f) {
             hazardOn = !hazardOn
             link.sendQueued("H,${if (hazardOn) 1 else 0}")
-            styleChip(hazardChip, hazardOn, WARN)
+            styleChip(hazardChip, hazardOn)
         }
-        holdChip = chip("Hold speed", 12f) {
+        holdChip = chip("Cruise", THROTTLE, 12f) {
             holdArmed = !holdArmed
             if (!holdArmed && (latest.flags and FLAG_HOLD) != 0) link.sendQueued("K,0")
-            styleChip(holdChip, holdArmed)
         }
-        tiltChip = chip("Tilt steer", 12f) { toggleTilt() }
+        tiltChip = chip("Tilt steer", STEER, 12f) { toggleTilt() }
 
         // ---- horn and brake sit under the steering pad
-        val hornChip = chip("Horn (hold)") { }
+        val hornChip = chip("Horn (hold)", LIGHT) { }
         hornChip.minHeight = dp(46)
         hornChip.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     link.sendQueued("V,1")
-                    styleChip(hornChip, true, WARN)
+                    styleChip(hornChip, true)
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     link.sendQueued("V,0")
@@ -438,97 +570,123 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             }
             true
         }
-        val brakeChip = chip("BRAKE") { link.sendQueued("X") }
+        // the brake button holds the full short brake for as long as it is pressed
+        brakeChip = chip("BRAKE (hold)", BRAKE) { }
         brakeChip.minHeight = dp(46)
-        styleChip(brakeChip, true, BAD)
+        brakeChip.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    btnBrake = true
+                    holdArmed = false
+                    styleChip(brakeChip, true)
+                    pushDrive()
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    btnBrake = false
+                    styleChip(brakeChip, false)
+                    pushDrive()
+                }
+            }
+            true
+        }
 
-        // ---- popup chips
-        stabChip = chip("Stability assist") {
+        // ---- assist toggles that live in the car's own state
+        stabChip = chip("Stability assist", ASSIST) {
             val on = (latest.flags and FLAG_STAB) != 0
             link.sendQueued("S,${if (on) 0 else 1}")
         }
-        headingChip = chip("Heading hold") {
+        headingChip = chip("Heading hold", ASSIST) {
             val on = (latest.flags and FLAG_HEADING) != 0
             link.sendQueued("G,${if (on) 0 else 1}")
         }
-        tiltRevChip = chip("Reverse tilt") {
+        tiltRevChip = chip("Reverse tilt", STEER) {
             tiltReverse = !tiltReverse
             styleChip(tiltRevChip, tiltReverse)
         }
+        // ---- assist switches that the app remembers and sends as one mask
+        val defs = listOf(
+            1 to "Collision protection", 2 to "Emergency steering", 4 to "Wall keeping", 8 to "Hill hold",
+            16 to "ABS guard", 32 to "Stuck cut-off", 64 to "Launch assist"
+        )
+        assistChips = defs.map { (bit, name) ->
+            val c = chip(name, ASSIST) { toggleAssist(bit) }
+            c to bit
+        }
 
         // ---- buttons that open popups (right column, above the steering pad)
-        modesBtn = chip("Mode") { showModes() }
-        autoBtn = chip("Auto") { showAuto() }
-        assistBtn = chip("Assists") { showAssists() }
-        settingsBtn = chip("Settings") { showSettings() }
+        modesBtn = chip("Mode", THROTTLE) { showModes() }
+        autoBtn = chip("Auto", AUTO) { showAuto() }
+        assistBtn = chip("Assists", ASSIST) { showAssists() }
+        settingsBtn = chip("Settings", NEUTRAL) { showSettings() }
 
-        // ---- sliders (live inside the Settings popup)
-        brightSeek = SeekBar(this)
-        brightSeek.max = 100
-        brightSeek.progress = 100
-        seekColors(brightSeek)
-        brightSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                if (fromUser) link.sendLatest("B", "B,$p")
-            }
-            override fun onStartTrackingTouch(s: SeekBar) {}
-            override fun onStopTrackingTouch(s: SeekBar) {
-                link.sendLatest("B", "B,${s.progress}")
-            }
+        // ---- sliders (live inside popups)
+        brightSeek = slider(100, 100, LIGHT, { p, user -> if (user) link.sendLatest("B", "B,$p") }, { p ->
+            link.sendLatest("B", "B,$p")
         })
         rampLabel = label("Acceleration ramp: 300 ms")
-        rampSeek = SeekBar(this)
-        rampSeek.max = 30
-        rampSeek.progress = 6
-        seekColors(rampSeek)
-        rampSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                rampLabel.text = "Acceleration ramp: ${p * 50} ms" + if (p == 0) " (launch mode)" else ""
-                if (fromUser) link.sendLatest("R", "R,${p * 50}")
-            }
-            override fun onStartTrackingTouch(s: SeekBar) {}
-            override fun onStopTrackingTouch(s: SeekBar) {
-                link.sendLatest("R", "R,${s.progress * 50}")
-            }
+        rampSeek = slider(30, 6, THROTTLE, { p, user ->
+            rampLabel.text = "Acceleration ramp: ${p * 50} ms" + if (p == 0) " (launch mode)" else ""
+            if (user) link.sendLatest("R", "R,${p * 50}")
+        }, { p -> link.sendLatest("R", "R,${p * 50}") })
+
+        diffLabel = label("Differential strength: $diffPct%")
+        diffSeek = slider(100, diffPct - 50, THROTTLE, { p, user ->
+            diffPct = 50 + p
+            diffLabel.text = "Differential strength: $diffPct%"
+            if (user) link.sendLatest("F", "F,$diffPct")
+        }, { _ ->
+            link.sendLatest("F", "F,$diffPct")
+            prefs().edit().putInt("diffPct", diffPct).apply()
         })
-        padSeek = SeekBar(this)
-        padSeek.max = 120
-        padSeek.progress = padLeftDp
-        seekColors(padSeek)
-        padSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                if (fromUser) {
-                    padLeftDp = p
-                    applyPadPositions()
-                }
-            }
-            override fun onStartTrackingTouch(s: SeekBar) {}
-            override fun onStopTrackingTouch(s: SeekBar) {
-                prefs().edit().putInt("padLeft", padLeftDp).apply()
-            }
+
+        travelLabel = label("Pad travel: $padTravel dp for full throttle or steering")
+        travelSeek = slider(70, padTravel - 40, NEUTRAL, { p, user ->
+            padTravel = 40 + p
+            travelLabel.text = "Pad travel: $padTravel dp for full throttle or steering"
+            if (user) applyTravel()
+        }, { _ ->
+            applyTravel()
+            prefs().edit().putInt("padTravel", padTravel).apply()
         })
-        raiseSeek = SeekBar(this)
-        raiseSeek.max = 100
-        raiseSeek.progress = steerRaiseDp
-        seekColors(raiseSeek)
-        raiseSeek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) {
-                if (fromUser) {
-                    steerRaiseDp = p
-                    applyPadPositions()
-                }
-            }
-            override fun onStartTrackingTouch(s: SeekBar) {}
-            override fun onStopTrackingTouch(s: SeekBar) {
-                prefs().edit().putInt("steerRaise", steerRaiseDp).apply()
-            }
+
+        returnLabel = label(returnText())
+        returnSeek = slider(30, steerReturn / 50, STEER, { p, user ->
+            steerReturn = p * 50
+            returnLabel.text = returnText()
+            if (user) link.sendLatest("U", "U,$steerReturn")
+        }, { _ ->
+            link.sendLatest("U", "U,$steerReturn")
+            prefs().edit().putInt("steerReturn", steerReturn).apply()
         })
+
+        gapLabel = label("Following gap: $gapPct%")
+        gapSeek = slider(150, gapPct - 50, ASSIST, { p, user ->
+            gapPct = 50 + p
+            gapLabel.text = "Following gap: $gapPct%"
+            if (user) link.sendLatest("J", "J,$gapPct")
+        }, { _ ->
+            link.sendLatest("J", "J,$gapPct")
+            prefs().edit().putInt("gapPct", gapPct).apply()
+        })
+
+        padSeek = slider(120, padLeftDp, NEUTRAL, { p, user ->
+            if (user) {
+                padLeftDp = p
+                applyPadPositions()
+            }
+        }, { _ -> prefs().edit().putInt("padLeft", padLeftDp).apply() })
+        raiseSeek = slider(100, steerRaiseDp, NEUTRAL, { p, user ->
+            if (user) {
+                steerRaiseDp = p
+                applyPadPositions()
+            }
+        }, { _ -> prefs().edit().putInt("steerRaise", steerRaiseDp).apply() })
 
         // ---- center column: status, readings, sonar picture, alerts, toggles
         centerBox = LinearLayout(this)
         centerBox.orientation = LinearLayout.VERTICAL
         centerBox.addView(statusRow)
-        centerBox.addView(row(batteryM.root, speedM.root, tiltM.root))
+        centerBox.addView(rowW(floatArrayOf(1.25f, 1f, 1f), speedM.root, batteryM.root, tiltM.root))
         val sonarLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         sonarLp.setMargins(dp(3), dp(3), dp(3), dp(3))
         centerBox.addView(sonarView, sonarLp)
@@ -559,6 +717,14 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         setContentView(root)
     }
 
+    private fun returnText(): String =
+        if (steerReturn == 0) "Steering return: instant" else "Steering return: $steerReturn ms to center"
+
+    private fun applyTravel() {
+        throttlePad.travelDp = padTravel.toFloat()
+        steerPad.travelDp = padTravel.toFloat()
+    }
+
     /** Throttle sits padLeft in from the edge; the steering pad is lifted above the horn and brake row. */
     private fun applyPadPositions() {
         throttleLp.setMargins(dp(padLeftDp), dp(4), dp(4), dp(4))
@@ -567,6 +733,12 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         centerBox.layoutParams = centerLp
         steerLp.setMargins(dp(4), 0, dp(4), dp(BOTTOM_ROW_DP + steerRaiseDp))
         steerPad.layoutParams = steerLp
+    }
+
+    private fun toggleAssist(bit: Int) {
+        assistMask = assistMask xor bit
+        prefs().edit().putInt("assistMask", assistMask).apply()
+        link.sendLatest("T", "T,$assistMask")
     }
 
     // ------------------------------------------------------------------ popups
@@ -583,15 +755,23 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         val c = column()
         c.addView(row(autoChips[0], autoChips[1]))
         c.addView(row(autoChips[2], autoChips[3]))
-        c.addView(note("Roam: drives around and steers away from walls. Follow: follows something in front of it. Corridor: keeps to the middle between two walls. Any of them stops if the link drops."))
+        c.addView(note("Roam: drives around and steers away from walls. Follow: follows something in front of it. Corridor: keeps to the middle between two walls. The car avoids reversing in all of them. Pick Manual or press the brake to take over. They stop if the link drops."))
         popup("Autonomous", c)
     }
 
     private fun showAssists() {
         val c = column()
+        c.addView(label("Collision and motion"))
+        c.addView(row(assistChips[0].first, assistChips[1].first))
+        c.addView(row(assistChips[2].first, assistChips[3].first))
+        c.addView(row(assistChips[4].first, assistChips[5].first))
+        c.addView(row(assistChips[6].first))
+        c.addView(label("Handling"))
         c.addView(row(stabChip, headingChip))
         c.addView(row(tiltRevChip))
-        c.addView(note("Stability assist calms the car when it starts to spin. Heading hold keeps it straight when you steer to center. Reverse tilt swaps the direction of tilt steering."))
+        c.addView(detach(gapLabel))
+        c.addView(detach(gapSeek))
+        c.addView(note("Collision protection limits speed so the car can always stop, lets you steer around things, and brakes hard if a crash is unavoidable. Emergency steering is the last resort: the car steers to the free side for about a second (push the steering pad hard the other way to take over). Wall keeping nudges you away from walls at the sides. ABS guard pulses the brake if the car starts to spin. Stuck cut-off drops the power when the car is pushing but not moving. Following gap is the distance Cruise keeps behind things; it grows with speed."))
         popup("Assists", c)
     }
 
@@ -601,23 +781,36 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         c.addView(detach(brightSeek))
         c.addView(detach(rampLabel))
         c.addView(detach(rampSeek))
+        c.addView(detach(diffLabel))
+        c.addView(detach(diffSeek))
+        c.addView(note("100% is the exact turning geometry of your car, and the car turns tighter at low speed. Raise it if the car turns wider than the steering asks for, lower it if the wheels scrub or the car spins out."))
+        c.addView(detach(returnLabel))
+        c.addView(detach(returnSeek))
+        c.addView(detach(travelLabel))
+        c.addView(detach(travelSeek))
         c.addView(label("Throttle pad: move to the right"))
         c.addView(detach(padSeek))
         c.addView(label("Steering pad: move up"))
         c.addView(detach(raiseSeek))
-        c.addView(row(chip("Calibrate the car's sensors") {
-            closePopup()
-            showCalibrate()
-        }))
+        c.addView(row(
+            chip("Calibrate") {
+                closePopup()
+                showCalibrate()
+            },
+            chip("Diagnostics") {
+                closePopup()
+                showDiagnostics()
+            }
+        ))
         popup("Settings", c)
     }
 
     private fun showCalibrate() {
         val c = column()
+        c.addView(label("1. Level and yaw"))
         c.addView(note(
-            "1. Put the car on a flat surface, keep it still, tap Level and zero. Roll and pitch should drop to about 0.\n" +
-            "2. Turn the car to the left by hand. Yaw should go up. If it goes down, tap Flip yaw direction.\n" +
-            "The result is saved in the car."
+            "Put the car on a flat surface, keep it still, tap Level and zero. Roll and pitch should drop to about 0. " +
+            "Then turn the car to the left by hand: yaw should go up. If it goes down, tap Flip yaw direction."
         ))
         c.addView(detach(calInfo))
         c.addView(row(
@@ -633,7 +826,112 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             chip("Flip yaw direction") { requireCar { link.sendQueued("N") } },
             chip("Clear saved level") { requireCar { link.sendQueued("C,0") } }
         ))
+        c.addView(label("2. Motion"))
+        c.addView(note(
+            "The car drives forward about 30 cm by itself to learn which way is forward for its motion sensor and how fast it really goes. " +
+            "Do Level and zero first. Needs a wall 50 to 400 cm straight ahead and a clear floor. Hold BRAKE to stop it."
+        ))
+        c.addView(detach(motionInfo))
+        c.addView(row(chip("Start motion calibration", AUTO) { confirmMotionCal() }))
         popup("Calibrate", c)
+    }
+
+    private fun confirmMotionCal() {
+        requireCar {
+            AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("The car will drive")
+                .setMessage("It moves forward about 30 cm by itself. Put it on the floor with a wall 50 to 400 cm straight ahead and nothing in the way. Hold BRAKE to stop it.")
+                .setPositiveButton("Start") { _, _ -> link.sendQueued("C,2") }
+                .setNegativeButton("Cancel") { _, _ -> }
+                .show()
+        }
+    }
+
+    private fun showDiagnostics() {
+        val c = column()
+        c.addView(detach(diagText))
+        c.addView(note("Turn rate: measured by the gyro, then what the steering should give at this speed. A big gap with the wheels straight means the car is drifting or sliding. Own speed is the larger of the motor model and the motion sensor."))
+        popup("Diagnostics", c)
+    }
+
+    private fun showManual() {
+        val c = column()
+        fun section(title: String, body: String) {
+            val h = TextView(this)
+            h.text = title
+            h.setTextColor(TEXT)
+            h.textSize = 15f
+            h.typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            h.setPadding(dp(4), dp(16), dp(4), dp(2))
+            c.addView(h)
+            val b = TextView(this)
+            b.text = body
+            b.setTextColor(MUTED)
+            b.textSize = 13f
+            b.setLineSpacing(0f, 1.15f)
+            b.setPadding(dp(4), dp(2), dp(4), dp(2))
+            c.addView(b)
+        }
+        section("Quick start",
+            "1. Switch the car on and pair its Bluetooth module in Android settings (PIN 1234).\n" +
+            "2. Tap Connect and pick the module. The app reconnects by itself next time.\n" +
+            "3. First time only: put the car on a flat floor, open Settings > Calibrate, tap Level and zero, then run Motion calibration.\n" +
+            "4. Put your left thumb on the throttle pad and push up.")
+        section("Throttle pad (left)",
+            "Put your thumb anywhere on the pad. Where it lands is zero, marked by a ring. Push up to go forward, down to reverse. " +
+            "A small dead zone around the ring ignores accidental slips, so a light tap never moves the car. " +
+            "Full throttle is at the distance set in Settings > Pad travel (smaller = more sensitive). Lift your thumb and the throttle returns to zero.")
+        section("Steering pad (right)",
+            "Same idea: where your thumb lands is straight ahead. Slide left or right. " +
+            "When you let go, the steering eases back to center over the time set in Settings > Steering return, which spares the servo. " +
+            "Tilt steer uses the phone like a steering wheel instead; Reverse tilt in Assists swaps the direction.")
+        section("Braking",
+            "While your thumb is on the throttle, slide it left past the red brake line. The car shorts both motors for the hardest stop it can do and holds it while you stay left. " +
+            "Slide back or lift to release. After a brake the throttle stays at zero until you lift or come back to the ring, so you can't lurch forward.\n" +
+            "The BRAKE button under the steering pad does the same while pressed. Braking ends Cruise and any Auto mode.\n" +
+            "ABS guard (Assists) pulses the brake if the gyro sees the car start to spin, since there are no wheel sensors.")
+        section("Mode, Auto, Assists, Settings",
+            "Mode: Eco, Normal or Sport. They set the top speed (55, 80, 100%) and how quickly the car accelerates.\n" +
+            "Auto: Roam, Follow or Corridor. The car avoids reversing: it tries a tight forward turn first, then a short, very slow reverse with beeps, then stops and tells you it needs help.\n" +
+            "Assists: switches for the collision system and handling aids.\n" +
+            "Settings: headlights, acceleration, differential, steering return, pad feel and position, Calibrate and Diagnostics.")
+        section("Cruise",
+            "Tap Cruise to get it ready, push the throttle to the speed you want, then let go: the car keeps that speed. " +
+            "If something is ahead it slows down to keep a gap that grows with speed (Assists > Following gap) and speeds back up once the way is clear. " +
+            "Touch the throttle or brake to cancel. Cruise works forward only.")
+        section("Collision protection",
+            "The car watches its three front sonars and its own speed, and it does this when you let go and it is rolling, too.\n" +
+            "1. It limits your speed smoothly so it can always stop in time.\n" +
+            "2. If there is free space on one side and you steer that way, it lets you go around.\n" +
+            "3. If a crash is unavoidable it brakes as hard as it can.\n" +
+            "4. If braking will not be enough it steers to the free side for about a second, then hands back. Push the steering pad hard the other way to take over.\n" +
+            "There are no sensors at the back, so reversing is never protected. The sonars are narrow: thin poles and soft things can be missed.")
+        section("Hill hold, launch assist, stuck",
+            "Hill hold: stopped on a slope steeper than 5 degrees, the car keeps the brakes on.\n" +
+            "Launch assist: adds a little throttle when you start uphill.\n" +
+            "Stuck cut-off: if you give throttle and the car does not move for about a second, power is cut and Stuck shows. Let go of the throttle and push again.\n" +
+            "Slip correction: if the car turns differently from what the steering asks for, the car steers against it and shows Slipping.")
+        section("Calibrate",
+            "Level and zero: car flat and still. Flip yaw direction if yaw goes down when you turn the car left.\n" +
+            "Motion calibration: the car drives about 30 cm forward by itself with a wall 50 to 400 cm ahead. It learns which way forward is for the motion sensor and its real speed, and saves both. Do it once, and again if the board is moved.\n" +
+            "Diagnostics shows live numbers: own speed, closing speed, turn rate against what steering should give, slope and the speed limit.")
+        section("What the alerts mean",
+            "Link lost: the phone link dropped and the car stopped.\n" +
+            "Battery cutoff or Limp mode: the pack is low.\n" +
+            "Flipped or Crash: the motion sensor saw it; the motors stop.\n" +
+            "Stuck: power was cut; release the throttle and push again.\n" +
+            "Steering for you: emergency steering is active.\n" +
+            "Braking: the collision system or you are braking hard.\n" +
+            "Slowing down: speed is limited because something is ahead.\n" +
+            "Hill hold, Slipping, Cruise: those aids are working.\n" +
+            "Auto mode needs help: it found no safe way forward and stopped.")
+        section("If something is off",
+            "Won't connect: the car must be on and paired first.\n" +
+            "Pads feel twitchy or slow: change Pad travel in Settings.\n" +
+            "Car turns wider or sharper than expected: change Differential strength.\n" +
+            "The car stops too early or too late near walls: it needs real-floor tuning of the braking numbers in the sketch (see the README).\n" +
+            "Nothing works after a crash of the app: reopen it; the last error is shown on screen.")
+        popup("Manual", c)
     }
 
     private fun toast(msg: String) {
@@ -641,7 +939,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     }
 
     private fun pushDrive() {
-        link.setDrive(curThrottle, curSteer)
+        link.setDrive(curThrottle, curSteer, padBrake || btnBrake)
     }
 
     // ------------------------------------------------------------------ rendering (10 times a second)
@@ -651,6 +949,32 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             render()
             ui.postDelayed(this, 100)
         }
+    }
+
+    private fun motionStatus(t: Telemetry, fresh: Boolean): String {
+        if (!fresh) return "Not connected"
+        return when (t.calState) {
+            1 -> "Running: the car is driving forward..."
+            2 -> "Done. Forward direction and speed learned and saved."
+            3 -> "Failed: no wall found 50 to 400 cm ahead. Move the car and try again."
+            4 -> "Stopped before it finished. Try again."
+            5 -> "The result looked odd. Check the car is on a flat floor and try again."
+            else -> if (t.fwdKnown) "Learned and saved in the car." else "Not learned yet. The car works without it, but motion checks are limited."
+        }
+    }
+
+    private fun flagNames(f: Int): String {
+        val n = ArrayList<String>()
+        if (f and FLAG_STUCK != 0) n.add("stuck")
+        if (f and FLAG_EMERGENCY != 0) n.add("emergency steer")
+        if (f and FLAG_HARD_BRAKE != 0) n.add("hard brake")
+        if (f and FLAG_LIMITED != 0) n.add("speed limited")
+        if (f and FLAG_HILL != 0) n.add("hill hold")
+        if (f and FLAG_DRIFT != 0) n.add("slip")
+        if (f and FLAG_HOLD != 0) n.add("cruise")
+        if (f and FLAG_BLOCKED != 0) n.add("blocked")
+        if (f and FLAG_GAVE_UP != 0) n.add("auto gave up")
+        return if (n.isEmpty()) "none" else n.joinToString(", ")
     }
 
     private fun render() {
@@ -664,7 +988,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             linkState == CarLink.State.CONNECTING -> "Connecting to $linkMessage..."
             else -> linkMessage
         }
-        statusText.setTextColor(if (fresh) GOOD else if (connected) WARN else MUTED)
+        statusText.setTextColor(if (fresh) THROTTLE else if (connected) LIGHT else MUTED)
         connectChip.text = if (connected) "Disconnect" else "Connect"
 
         if (fresh) {
@@ -676,9 +1000,10 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
                 batteryM.value.setTextColor(MUTED)
             } else {
                 batteryM.value.text = String.format(Locale.US, "%.2f V", t.battV)
-                batteryM.value.setTextColor(if (t.battV < 6.8f) BAD else if (t.battV < 7.2f) WARN else GOOD)
+                batteryM.value.setTextColor(if (t.battV < 6.8f) BRAKE else if (t.battV < 7.2f) LIGHT else THROTTLE)
             }
-            speedM.value.text = "${t.speed}%"
+            speedM.value.text = "${t.speed}"
+            speedM.value.setTextColor(if (t.speed < 0) LIGHT else TEXT)
             tiltM.value.text = "R${t.roll} P${t.pitch}"
             calInfo.text = "Roll ${t.roll}   Pitch ${t.pitch}   Yaw ${t.yaw}"
         } else {
@@ -690,44 +1015,89 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         }
         sonarView.setData(t.distC, t.distL, t.distR, fresh)
 
-        // alerts
+        // alerts, most urgent first
         val f = t.flags
         val parts = ArrayList<String>()
+        var danger = false
+        var warn = false
         if (fresh) {
-            if (f and FLAG_LINK_LOST != 0) parts.add("Link lost, car stopped")
-            if (f and FLAG_CUTOFF != 0) parts.add("Battery cutoff")
-            if (f and FLAG_FLIPPED != 0) parts.add("Flipped")
-            if (f and FLAG_CRASH != 0) parts.add("Crash detected")
-            if (f and FLAG_LIMP != 0) parts.add("Limp mode: battery low")
-            if (f and FLAG_BLOCKED != 0) parts.add("Obstacle ahead")
-            if (f and FLAG_HOLD != 0) parts.add("Holding speed (touch throttle to release)")
+            fun add(text: String, level: Int) {
+                parts.add(text)
+                if (level == 2) danger = true
+                if (level == 1) warn = true
+            }
+            if (f and FLAG_LINK_LOST != 0) add("Link lost, car stopped", 2)
+            if (f and FLAG_CUTOFF != 0) add("Battery cutoff", 2)
+            if (f and FLAG_FLIPPED != 0) add("Flipped", 2)
+            if (f and FLAG_CRASH != 0) add("Crash detected", 2)
+            if (f and FLAG_STUCK != 0) add("Stuck, power cut. Let go of the throttle and push again", 2)
+            if (f and FLAG_GAVE_UP != 0) add("Auto mode needs help: no safe way forward", 2)
+            if (f and FLAG_EMERGENCY != 0) add("Steering for you (push the pad hard the other way to take over)", 1)
+            if (f and FLAG_HARD_BRAKE != 0) add("Braking", 1)
+            if (f and FLAG_LIMITED != 0) add("Slowing down: obstacle ahead (limit ${t.cap}%)", 1)
+            if (f and FLAG_LIMP != 0) add("Limp mode: battery low", 1)
+            if (f and FLAG_BLOCKED != 0 && f and FLAG_LIMITED == 0) add("Obstacle ahead", 1)
+            if (f and FLAG_DRIFT != 0) add("Slipping, correcting", 0)
+            if (f and FLAG_HILL != 0) add("Hill hold", 0)
+            if (f and FLAG_HOLD != 0) add("Cruise on (touch throttle to release)", 0)
         }
-        val danger = f and (FLAG_LINK_LOST or FLAG_CUTOFF or FLAG_FLIPPED or FLAG_CRASH) != 0
-        val warn = f and (FLAG_LIMP or FLAG_BLOCKED) != 0
-        alertText.text = if (!fresh) "" else if (parts.isEmpty()) "All clear" else parts.joinToString("  |  ")
-        alertText.setTextColor(if (!fresh) MUTED else if (danger) BAD else if (warn) WARN else if (parts.isEmpty()) GOOD else ACCENT)
+        alertText.text = if (!fresh) "" else if (parts.isEmpty()) "All clear" else parts.take(2).joinToString("  |  ")
+        alertText.setTextColor(if (!fresh) MUTED else if (danger) BRAKE else if (warn) LIGHT else if (parts.isEmpty()) THROTTLE else ASSIST)
+        sonarView.setEdge(
+            if (!fresh) 0
+            else if (f and (FLAG_EMERGENCY or FLAG_HARD_BRAKE or FLAG_STUCK) != 0) BRAKE
+            else if (f and FLAG_LIMITED != 0) LIGHT
+            else 0
+        )
 
         // chip highlights follow what the car reports
-        for (i in modeChips.indices) styleChip(modeChips[i], i == t.mode)
-        for (i in autoChips.indices) styleChip(autoChips[i], i == t.auto)
+        for (i in modeChips.indices) styleChip(modeChips[i], fresh && i == t.mode)
+        for (i in autoChips.indices) styleChip(autoChips[i], fresh && i == t.auto)
         val stabOn = f and FLAG_STAB != 0
         val headingOn = f and FLAG_HEADING != 0
         styleChip(stabChip, stabOn)
         styleChip(headingChip, headingOn)
         val holding = f and FLAG_HOLD != 0
-        styleChip(holdChip, holdArmed || holding, if (holding) WARN else ACCENT)
+        holdChip.text = if (holding) "Cruise on" else if (holdArmed) "Cruise ready" else "Cruise"
+        styleChip(holdChip, holding, holdArmed && !holding)
         styleChip(tiltChip, tiltOn)
+        styleChip(tiltRevChip, tiltReverse)
+        styleChip(lightsChip, lightsOn)
+        styleChip(hazardChip, hazardOn)
+        for ((c, bit) in assistChips) styleChip(c, assistMask and bit != 0)
 
         // popup buttons show the current state
         modesBtn.text = if (fresh) "Mode: " + MODE_NAMES.getOrElse(t.mode) { "?" } else "Mode"
         autoBtn.text = if (fresh) "Auto: " + AUTO_NAMES.getOrElse(t.auto) { "?" } else "Auto"
-        val assists = (if (stabOn) 1 else 0) + (if (headingOn) 1 else 0)
-        assistBtn.text = if (assists > 0) "Assists ($assists on)" else "Assists"
+        var assists = (if (stabOn) 1 else 0) + (if (headingOn) 1 else 0)
+        for ((_, bit) in assistChips) if (assistMask and bit != 0) assists++
+        assistBtn.text = "Assists $assists/${assistChips.size + 2}"
         styleChip(modesBtn, false)
         styleChip(autoBtn, fresh && t.auto != 0)
-        styleChip(assistBtn, assists > 0)
+        styleChip(assistBtn, false, assists > 0)
         styleChip(settingsBtn, false)
+
+        // motion calibration and diagnostics (only drawn while their popup is open, but cheap)
+        motionInfo.text = motionStatus(t, fresh)
+        diagText.text = if (!fresh) "Not connected" else String.format(
+            Locale.US,
+            "Own speed      %4d cm/s\n" +
+            "Closing speed  %4d cm/s\n" +
+            "Turn rate      %4d dps  (steering gives %d)\n" +
+            "Slope          %+5.1f deg\n" +
+            "Speed limit    %4d %%\n" +
+            "Forward known  %s\n" +
+            "Sonar C/L/R    %s / %s / %s\n" +
+            "G-force        %.1f\n" +
+            "Active         %s",
+            t.vOwn, t.vClose, t.yawAct, t.yawExp, t.slope, t.cap,
+            if (t.fwdKnown) "yes" else "no",
+            cm(t.distC), cm(t.distL), cm(t.distR), t.gForce, flagNames(f)
+        )
     }
+
+    private fun cm(d: Int): String = if (d >= 900) "clear" else "$d"
+
     // ------------------------------------------------------------------ CarLink.Listener
 
     override fun onState(state: CarLink.State, message: String) {
@@ -751,6 +1121,10 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         link.sendQueued("L,${if (lightsOn) 1 else 0}")
         link.sendLatest("B", "B,${brightSeek.progress}")
         link.sendLatest("R", "R,${rampSeek.progress * 50}")
+        link.sendLatest("F", "F,$diffPct")
+        link.sendLatest("T", "T,$assistMask")
+        link.sendLatest("U", "U,$steerReturn")
+        link.sendLatest("J", "J,$gapPct")
         pushDrive()
     }
 
