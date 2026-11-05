@@ -33,8 +33,19 @@ data class Telemetry(
     val yawExp: Int = 0,        // turn rate the steering should give, deg/s
     val slope: Float = 0f,      // + = nose up, degrees
     val cap: Int = 100,         // speed limit set by the collision system, %
-    val calState: Int = 0,      // motion calibration: 0 idle, 1 running, 2 done, 3 no wall, 4 aborted, 5 odd result
-    val fwdKnown: Boolean = false
+    val calState: Int = 0,      // calibration: 0 idle, 1 running, 2 done, 3 no wall 280-400 cm, 4 aborted, 5 failed (see calWhy)
+    val fwdKnown: Boolean = false,
+    val calWhy: Int = 0,        // why the last calibration failed, 1..7 (see the firmware header)
+    val brakeDecel: Int = 0,    // braking rate the car uses, cm/s2 (measured by the calibration)
+    val kSpeed: Float = 0f,     // real speed in cm/s per % of throttle
+    val flags2: Int = 0,        // 1 traction working, 2 ABS pulsing, 4 steering around, 8 sonars on, 16 braking for a roll or push
+    // raw numbers of the last calibration run (W line), shown in Diagnostics, also when the run failed
+    val hasRun: Boolean = false,
+    val runPush: Int = 0,       // mean push felt at launch, cm/s2
+    val runMs: Int = 0,         // time for the 70..190 cm stretch, ms
+    val runK: Float = 0f,       // measured cm/s per % of throttle
+    val runDecel: Int = 0,      // measured braking rate, cm/s2
+    val runBrakeMs: Int = 0     // how long the car braked hard, ms
 )
 
 /**
@@ -239,7 +250,7 @@ class CarLink(private val listener: Listener) {
                             t = parsed
                             if (my == session) listener.onTelemetry(t)
                         }
-                    } else if (c != '\r' && line.length < 64) {
+                    } else if (c != '\r' && line.length < 100) {
                         line.append(c)
                     }
                 }
@@ -265,10 +276,17 @@ class CarLink(private val listener: Listener) {
                     gForce = p[4].toInt() / 10f, battV = p[5].toInt() / 100f, speed = p[6].toInt()
                 )
             }
-            if (p.size >= 9 && p[0] == "M") {
+            if (p.size >= 6 && p[0] == "W") {
+                return prev.copy(
+                    hasRun = true, runPush = p[1].toInt(), runMs = p[2].toInt(), runK = p[3].toInt() / 100f,
+                    runDecel = p[4].toInt(), runBrakeMs = p[5].trim().toInt()
+                )
+            }
+            if (p.size >= 13 && p[0] == "M") {
                 return prev.copy(
                     vOwn = p[1].toInt(), vClose = p[2].toInt(), yawAct = p[3].toInt(), yawExp = p[4].toInt(),
-                    slope = p[5].toInt() / 10f, cap = p[6].toInt(), calState = p[7].toInt(), fwdKnown = p[8].trim() != "0"
+                    slope = p[5].toInt() / 10f, cap = p[6].toInt(), calState = p[7].toInt(), fwdKnown = p[8].trim() != "0",
+                    calWhy = p[9].toInt(), brakeDecel = p[10].toInt(), kSpeed = p[11].toInt() / 100f, flags2 = p[12].trim().toInt()
                 )
             }
         } catch (e: NumberFormatException) {

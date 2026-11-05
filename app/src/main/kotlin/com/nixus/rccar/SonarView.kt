@@ -18,6 +18,7 @@ class SonarView(context: Context) : View(context) {
     private var distL = 999
     private var distR = 999
     private var live = false
+    private var off = false
 
     private val dm = resources.displayMetrics.density
     private val rect = RectF()
@@ -45,6 +46,13 @@ class SonarView(context: Context) : View(context) {
     }
 
     private var edgeColor = 0
+
+    /** The sonars are switched off in the car: show short grey beams marked "off" instead of "clear". */
+    fun setOff(isOff: Boolean) {
+        if (isOff == off) return
+        off = isOff
+        invalidate()
+    }
 
     fun setData(c: Int, l: Int, r: Int, isLive: Boolean) {
         if (c == distC && l == distL && r == distR && isLive == live) return
@@ -109,7 +117,7 @@ class SonarView(context: Context) : View(context) {
     private fun beam(canvas: Canvas, x0: Float, y0: Float, dirX: Float, cosA: Float, dist: Int, maxAhead: Float, w: Float) {
         val sinA = if (dirX == 0f) 0f else 0.643f
         val clear = dist >= 900
-        val frac = if (!live) 0.35f else if (clear) 1f else min(1f, max(0.08f, dist / 150f))
+        val frac = if (!live || off) 0.35f else if (clear) 1f else min(1f, max(0.08f, dist / 150f))
         var len = frac * maxAhead / cosA
         if (dirX != 0f) {
             // keep the tip on screen sideways
@@ -118,13 +126,13 @@ class SonarView(context: Context) : View(context) {
         }
         val x1 = x0 + dirX * sinA * len
         val y1 = y0 - cosA * len
-        val color = if (!live) 0xFF3A4048.toInt() else colorFor(dist)
+        val color = if (!live || off) 0xFF3A4048.toInt() else colorFor(dist)
         beamPaint.color = color
         canvas.drawLine(x0, y0, x1, y1, beamPaint)
         dotPaint.color = color
         canvas.drawCircle(x1, y1, 5f * dm, dotPaint)
-        textPaint.color = if (live) color else 0xFF8C9096.toInt()
-        val label = if (!live) "-" else if (clear) "clear" else "$dist cm"
+        textPaint.color = if (live && !off) color else 0xFF8C9096.toInt()
+        val label = if (!live) "-" else if (off) "off" else if (clear) "clear" else "$dist cm"
         val lx = min(max(x1, 30f * dm), w - 30f * dm)
         canvas.drawText(label, lx, y1 - 9f * dm, textPaint)
     }

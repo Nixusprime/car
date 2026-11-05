@@ -69,6 +69,15 @@ private const val FLAG_HILL = 8192
 private const val FLAG_DRIFT = 16384
 private const val FLAG_GAVE_UP = 32768
 
+private const val FLAG2_TRACTION = 1
+private const val FLAG2_ABS = 2
+private const val FLAG2_STEER_AROUND = 4
+private const val FLAG2_SONAR_ON = 8
+private const val FLAG2_COAST_BRAKE = 16
+private val TRACTION_DEFAULTS = intArrayOf(0, 30, 80)          // Eco, Normal, Sport
+private val AUTO_MAX_DEFAULTS = intArrayOf(100, 50, 45, 45)    // index 1..3 = Roam, Follow, Corridor
+private const val DEFAULT_ABS_MODES = 6                        // Normal and Sport
+
 private const val REQ_BT = 1
 private const val TILT_MAX_DEG = 40f
 private const val TILT_DEADZONE_DEG = 3f
@@ -96,6 +105,8 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     private var linkState = CarLink.State.DISCONNECTED
     private var linkMessage = "Not connected"
 
+    private val autopilot = Autopilot()
+    private var autoOwnsDrive = false
     private var curThrottle = 0
     private var curSteer = 0
     private var padBrake = false
@@ -154,6 +165,17 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     private var steerReturn = DEFAULT_STEER_RETURN
     private var gapPct = DEFAULT_GAP
     private var assistMask = ALL_ASSISTS
+    private val tractionByMode = IntArray(3)
+    private var absModes = DEFAULT_ABS_MODES
+    private var sonarEnabled = true
+    private val autoMax = IntArray(4)
+    private var tractionShownMode = 1
+    private lateinit var tractionLabel: TextView
+    private lateinit var tractionSeek: SeekBar
+    private lateinit var absModeChips: List<Pair<TextView, Int>>
+    private lateinit var sonarChip: TextView
+    private lateinit var autoMaxLabels: List<TextView>
+    private lateinit var autoMaxSeeks: List<SeekBar>
     private lateinit var sensors: SensorManager
 
     // layout pieces whose margins the position sliders move
@@ -214,11 +236,15 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     override fun onResume() {
         super.onResume()
         ui.post(renderTask)
+        ui.post(autoTask)
         if (tiltOn) registerTilt()
     }
 
     override fun onPause() {
         ui.removeCallbacks(renderTask)
+        ui.removeCallbacks(autoTask)
+        autoOwnsDrive = false
+        link.sendQueued("A,0")
         sensors.unregisterListener(this)
         curThrottle = 0
         padBrake = false
@@ -422,6 +448,10 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         steerReturn = prefs().getInt("steerReturn", DEFAULT_STEER_RETURN).coerceIn(0, 1500)
         gapPct = prefs().getInt("gapPct", DEFAULT_GAP).coerceIn(50, 200)
         assistMask = prefs().getInt("assistMask", ALL_ASSISTS) and ALL_ASSISTS
+        for (i in 0..2) tractionByMode[i] = prefs().getInt("traction$i", TRACTION_DEFAULTS[i]).coerceIn(0, 100)
+        absModes = prefs().getInt("absModes", DEFAULT_ABS_MODES) and 7
+        sonarEnabled = prefs().getBoolean("sonarOn", true)
+        for (i in 1..3) autoMax[i] = prefs().getInt("autoMax$i", AUTO_MAX_DEFAULTS[i]).coerceIn(15, 100)
 
         // ---- pads
         throttlePad = AxisPad(this, true)
@@ -528,6 +558,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         modeChips = MODE_NAMES.mapIndexed { i, n ->
             chip(n, THROTTLE) {
                 link.sendQueued("M,$i")
+                link.sendQueued("Q,${tractionByMode[i]}")          // a mode change resets the car's traction strength: send ours
                 val defaults = intArrayOf(600, 300, 150)
                 rampSeek.progress = defaults[i] / 50
                 closePopup()
@@ -535,6 +566,10 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         }
         autoChips = AUTO_NAMES.mapIndexed { i, n ->
             chip(n, AUTO) {
+                if (i != 0 && !sonarEnabled) {
+                    toast("Sonars are off. Turn them on in Assists first")
+                    return@chip
+                }
                 link.sendQueued("A,$i")
                 closePopup()
             }
@@ -614,6 +649,31 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         assistChips = defs.map { (bit, name) ->
             val c = chip(name, ASSIST) { toggleAssist(bit) }
             c to bit
+        }
+
+        // ---- ABS per drive mode, sonar switch, traction strength
+        absModeChips = MODE_NAMES.mapIndexed { i, n -> chip(n, ASSIST) { toggleAbsMode(i) } to i }
+        sonarChip = chip("Sonars on", ASSIST) { toggleSonar() }
+        tractionLabel = label(tractionText(tractionShownMode))
+        tractionSeek = slider(100, tractionByMode[tractionShownMode], THROTTLE, { p, user ->
+            val m = tractionShownMode.coerceIn(0, 2)
+            if (user) tractionByMode[m] = p
+            tractionLabel.text = tractionText(m)
+            if (user) link.sendLatest("Q", "Q,$p")
+        }, { p ->
+            link.sendLatest("Q", "Q,$p")
+            prefs().edit().putInt("traction${tractionShownMode.coerceIn(0, 2)}", p).apply()
+        })
+        autoMaxLabels = (1..3).map { label(autoMaxText(it)) }
+        autoMaxSeeks = (1..3).map { i ->
+            slider(85, autoMax[i] - 15, AUTO, { p, user ->
+                autoMax[i] = 15 + p
+                autoMaxLabels[i - 1].text = autoMaxText(i)
+                if (user) link.sendLatest("E$i", "E,$i,${autoMax[i]}")
+            }, { _ ->
+                link.sendLatest("E$i", "E,$i,${autoMax[i]}")
+                prefs().edit().putInt("autoMax$i", autoMax[i]).apply()
+            })
         }
 
         // ---- buttons that open popups (right column, above the steering pad)
@@ -738,6 +798,27 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         steerPad.layoutParams = steerLp
     }
 
+    private fun tractionText(mode: Int): String {
+        val m = mode.coerceIn(0, 2)
+        val v = tractionByMode[m]
+        return "Traction control, ${MODE_NAMES[m]}: " + if (v == 0) "off" else "$v%"
+    }
+
+    private fun autoMaxText(i: Int): String = "${AUTO_NAMES[i]} top speed: ${autoMax[i]}%"
+
+    private fun toggleAbsMode(i: Int) {
+        absModes = absModes xor (1 shl i)
+        prefs().edit().putInt("absModes", absModes).apply()
+        link.sendLatest("Y", "Y,$absModes")
+    }
+
+    private fun toggleSonar() {
+        sonarEnabled = !sonarEnabled
+        prefs().edit().putBoolean("sonarOn", sonarEnabled).apply()
+        link.sendLatest("O", "O,${if (sonarEnabled) 1 else 0}")
+        if (!sonarEnabled) toast("Sonars off: no collision protection and no Auto modes")
+    }
+
     private fun toggleAssist(bit: Int) {
         assistMask = assistMask xor bit
         prefs().edit().putInt("assistMask", assistMask).apply()
@@ -750,7 +831,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         val c = column()
         c.addView(label("Drive mode"))
         c.addView(row(modeChips[0], modeChips[1], modeChips[2]))
-        c.addView(note("Top speed: Eco 55%, Normal 80%, Sport 100%. Picking a mode also sets a matching acceleration ramp."))
+        c.addView(note("Top speed: Eco 55%, Normal 80%, Sport 100%. Picking a mode also sets a matching acceleration ramp and traction control strength (Eco off, Normal 30%, Sport 80%; change it in Assists)."))
         popup("Drive mode", c)
     }
 
@@ -758,7 +839,12 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         val c = column()
         c.addView(row(autoChips[0], autoChips[1]))
         c.addView(row(autoChips[2], autoChips[3]))
-        c.addView(note("Roam: drives around and steers away from walls. Follow: follows something in front of it. Corridor: keeps to the middle between two walls. The car avoids reversing in all of them. Pick Manual or press the brake to take over. They stop if the link drops."))
+        c.addView(label("Top speed of each mode"))
+        for (i in 1..3) {
+            c.addView(detach(autoMaxLabels[i - 1]))
+            c.addView(detach(autoMaxSeeks[i - 1]))
+        }
+        c.addView(note("Auto modes need the sonars (Assists > Sonars). Roam: drives around and steers away from walls. Follow: follows something in front of it. Corridor: keeps to the middle between two walls. The car avoids reversing in all of them. Pick Manual or press the brake to take over. They stop if the link drops."))
         popup("Autonomous", c)
     }
 
@@ -769,12 +855,22 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         c.addView(row(assistChips[2].first, assistChips[3].first))
         c.addView(row(assistChips[4].first, assistChips[5].first))
         c.addView(row(assistChips[6].first))
+        c.addView(label("Sonars"))
+        c.addView(row(sonarChip))
+        c.addView(note("Off: the front sonars are not read at all. There is no collision protection, wall keeping, Cruise gap, Auto mode or motion calibration, and the car will hit what is in front of it."))
+        c.addView(label("Traction and ABS"))
+        c.addView(detach(tractionLabel))
+        c.addView(detach(tractionSeek))
+        c.addView(note("Traction control (launch only) cuts the power for a moment when the wheels spin and the car is not picking up speed, then gives it back as they grip. Each mode keeps its own strength. Needs Motion and braking calibration."))
+        c.addView(label("ABS in these drive modes (needs ABS guard on)"))
+        c.addView(row(absModeChips[0].first, absModeChips[1].first, absModeChips[2].first))
+        c.addView(note("At speed ABS pulses the brake so the wheels keep gripping, and once the car has slowed down it applies the full brake. It also pulses if the car starts to spin. Sport and Normal are on by default."))
         c.addView(label("Handling"))
         c.addView(row(stabChip, headingChip))
         c.addView(row(tiltRevChip))
         c.addView(detach(gapLabel))
         c.addView(detach(gapSeek))
-        c.addView(note("Collision protection limits speed so the car can always stop, lets you steer around things, and brakes hard if a crash is unavoidable. Emergency steering is the last resort: the car steers to the free side for about a second (push the steering pad hard the other way to take over). Wall keeping nudges you away from walls at the sides. ABS guard pulses the brake if the car starts to spin. Stuck cut-off drops the power when the car is pushing but not moving. Following gap is the distance Cruise keeps behind things; it grows with speed."))
+        c.addView(note("Collision protection limits speed so the car can always stop, lets you steer around things, and brakes hard if a crash is unavoidable. Before that, if there is free space on one side, it slows down and steers around the obstacle early, then hands back to you (push the steering pad hard the other way to take over). Emergency steering is the last resort: the car steers to the free side for about a second. Wall keeping nudges you away from walls at the sides. ABS guard is the master switch for ABS. Stuck cut-off drops the power when the car is pushing but not moving. Following gap is the distance Cruise keeps behind things; it grows with speed."))
         popup("Assists", c)
     }
 
@@ -829,21 +925,26 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             chip("Flip yaw direction") { requireCar { link.sendQueued("N") } },
             chip("Clear saved level") { requireCar { link.sendQueued("C,0") } }
         ))
-        c.addView(label("2. Motion"))
+        c.addView(label("2. Motion and braking"))
         c.addView(note(
-            "The car drives forward about 30 cm by itself to learn which way is forward for its motion sensor and how fast it really goes. " +
-            "Do Level and zero first. Needs a wall 50 to 400 cm straight ahead and a clear floor. Hold BRAKE to stop it."
+            "The car drives about 2 m at full power toward a wall, then brakes hard. It learns which way is forward for its motion sensor, " +
+            "its real speed and its real braking rate. Do Level and zero first. Needs a flat wall 280 to 400 cm straight ahead and a clear, " +
+            "grippy floor. Hold BRAKE to stop it. Every number it measured shows in Diagnostics, also when it fails."
         ))
         c.addView(detach(motionInfo))
-        c.addView(row(chip("Start motion calibration", AUTO) { confirmMotionCal() }))
+        c.addView(row(chip("Start motion and braking calibration", AUTO) { confirmMotionCal() }))
         popup("Calibrate", c)
     }
 
     private fun confirmMotionCal() {
         requireCar {
+            if (!sonarEnabled) {
+                toast("Turn the sonars on first (Assists)")
+                return@requireCar
+            }
             AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
                 .setTitle("The car will drive")
-                .setMessage("It moves forward about 30 cm by itself. Put it on the floor with a wall 50 to 400 cm straight ahead and nothing in the way. Hold BRAKE to stop it.")
+                .setMessage("It drives about 2 m forward at full power, then brakes hard. Put it on the floor with a flat wall 280 to 400 cm straight ahead (about 3 m) and nothing in the way, and stand clear. Hold BRAKE to stop it.")
                 .setPositiveButton("Start") { _, _ -> link.sendQueued("C,2") }
                 .setNegativeButton("Cancel") { _, _ -> }
                 .show()
@@ -853,7 +954,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     private fun showDiagnostics() {
         val c = column()
         c.addView(detach(diagText))
-        c.addView(note("Turn rate: measured by the gyro, then what the steering should give at this speed. A big gap with the wheels straight means the car is drifting or sliding. Own speed is the larger of the motor model and the motion sensor."))
+        c.addView(note("Turn rate: measured by the gyro, then what the steering should give at this speed. A big gap with the wheels straight means the car is drifting or sliding. Own speed is the larger of the motor model and the motion sensor. Last calibration run lists the raw numbers of the latest motion and braking calibration, so a failure shows which check it missed."))
         popup("Diagnostics", c)
     }
 
@@ -878,7 +979,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         section("Quick start",
             "1. Switch the car on and pair its Bluetooth module in Android settings (PIN 1234).\n" +
             "2. Tap Connect and pick the module. The app reconnects by itself next time.\n" +
-            "3. First time only: put the car on a flat floor, open Settings > Calibrate, tap Level and zero, then run Motion calibration.\n" +
+            "3. First time only: put the car on a flat floor, open Settings > Calibrate, tap Level and zero, then run Motion and braking calibration (it needs a wall about 3 m ahead).\n" +
             "4. Put your left thumb on the throttle pad and push up.")
         section("Throttle pad (left)",
             "Put your thumb anywhere on the pad. Where it lands is zero, marked by a ring. Push up to go forward, down to reverse. " +
@@ -892,10 +993,13 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             "While your thumb is on the throttle, slide it left past the red brake line. The car shorts both motors for the hardest stop it can do and holds it while you stay left. " +
             "Slide back or lift to release. After a brake the throttle stays at zero until you lift or come back to the ring, so you can't lurch forward.\n" +
             "The BRAKE button under the steering pad does the same while pressed. Braking ends Cruise and any Auto mode.\n" +
-            "ABS guard (Assists) pulses the brake if the gyro sees the car start to spin, since there are no wheel sensors.")
+            "ABS (Assists) works per drive mode. Above a walking pace it pulses the brake so the wheels keep gripping, and once the car has slowed down it applies the full brake. It also pulses if the gyro sees the car start to spin. ABS guard is the master switch; the Eco, Normal and Sport buttons choose where it is active.")
+        section("Traction control",
+            "On launch, if the wheels spin and the car is not picking up speed, the car cuts the power for a moment and gives it back as the wheels grip. " +
+            "Each drive mode has its own strength (Eco off, Normal 30%, Sport 80%); change it in Assists. It reacts within a fraction of a second and needs Motion and braking calibration.")
         section("Mode, Auto, Assists, Settings",
             "Mode: Eco, Normal or Sport. They set the top speed (55, 80, 100%) and how quickly the car accelerates.\n" +
-            "Auto: Roam, Follow or Corridor. The car avoids reversing: it tries a tight forward turn first, then a short, very slow reverse with beeps, then stops and tells you it needs help.\n" +
+            "Auto: Roam, Follow or Corridor, each with its own top speed slider. The car avoids reversing: it tries a tight forward turn first, then a short, very slow reverse with beeps, then stops and tells you it needs help.\n" +
             "Assists: switches for the collision system and handling aids.\n" +
             "Settings: headlights, acceleration, differential, steering return, pad feel and position, Calibrate and Diagnostics.")
         section("Cruise",
@@ -906,9 +1010,12 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             "The car watches its three front sonars and its own speed, and it does this when you let go and it is rolling, too.\n" +
             "1. It limits your speed smoothly so it can always stop in time.\n" +
             "2. If there is free space on one side and you steer that way, it lets you go around.\n" +
-            "3. If a crash is unavoidable it brakes as hard as it can.\n" +
-            "4. If braking will not be enough it steers to the free side for about a second, then hands back. Push the steering pad hard the other way to take over.\n" +
-            "There are no sensors at the back, so reversing is never protected. The sonars are narrow: thin poles and soft things can be missed.")
+            "3. With free space on one side it slows down and steers around the obstacle early, then hands back (Steering around it). You can override by pushing the steering pad hard the other way.\n" +
+            "4. If a crash is unavoidable it brakes as hard as it can.\n" +
+            "5. If braking will not be enough it steers to the free side for about a second, then hands back.\n" +
+            "If the car is rolling or you give it a push toward something with no throttle, it brakes too.\n" +
+            "There are no sensors at the back, so reversing is never protected. The sonars are narrow: thin poles and soft things can be missed.\n" +
+            "Sonars off (Assists > Sonars): the sonars are not read at all. Collision protection, wall keeping, Cruise gap and the Auto modes stop working, and the car will hit what is in front of it.")
         section("Hill hold, launch assist, stuck",
             "Hill hold: stopped on a slope steeper than 5 degrees, the car keeps the brakes on.\n" +
             "Launch assist: adds a little throttle when you start uphill.\n" +
@@ -916,15 +1023,18 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             "Slip correction: if the car turns differently from what the steering asks for, the car steers against it and shows Slipping.")
         section("Calibrate",
             "Level and zero: car flat and still. Flip yaw direction if yaw goes down when you turn the car left.\n" +
-            "Motion calibration: the car drives about 30 cm forward by itself with a wall 50 to 400 cm ahead. It learns which way forward is for the motion sensor and its real speed, and saves both. Do it once, and again if the board is moved.\n" +
-            "Diagnostics shows live numbers: own speed, closing speed, turn rate against what steering should give, slope and the speed limit.")
+            "Motion and braking calibration: with a flat wall 280 to 400 cm straight ahead (about 3 m) the car drives about 2 m at full power, then brakes hard. It learns which way forward is for the motion sensor, its real speed and its real braking rate, and saves them. Do it once, again if the board is moved, and after changing tyres or the floor. If it fails, the message says which check missed, and Diagnostics lists every number it measured.\n" +
+            "Diagnostics shows live numbers: own speed, closing speed, turn rate against what steering should give, slope, the speed limit, traction and ABS activity, and the last calibration run.")
         section("What the alerts mean",
             "Link lost: the phone link dropped and the car stopped.\n" +
             "Battery cutoff or Limp mode: the pack is low.\n" +
             "Flipped or Crash: the motion sensor saw it; the motors stop.\n" +
             "Stuck: power was cut; release the throttle and push again.\n" +
             "Steering for you: emergency steering is active.\n" +
-            "Braking: the collision system or you are braking hard.\n" +
+            "Steering around it: the car is steering around an obstacle on its own.\n" +
+            "Braking: the collision system or you are braking hard. Rolling toward something means it is braking because the car is coasting or was pushed.\n" +
+            "Traction control, ABS: the aid is working right now.\n" +
+            "Sonars off: collision protection is disabled.\n" +
             "Slowing down: speed is limited because something is ahead.\n" +
             "Hill hold, Slipping, Cruise: those aids are working.\n" +
             "Auto mode needs help: it found no safe way forward and stopped.")
@@ -942,7 +1052,34 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     }
 
     private fun pushDrive() {
-        link.setDrive(curThrottle, curSteer, padBrake || btnBrake)
+        val brake = padBrake || btnBrake
+        if (latest.auto != 0 && !brake) return      // the autopilot owns the drive line while an Auto mode runs
+        link.setDrive(curThrottle, curSteer, brake)
+    }
+
+    // Roam / Follow / Corridor run here on the phone (they no longer fit in the Nano): sonar in, throttle and steering out.
+    private val autoTask = object : Runnable {
+        override fun run() {
+            val t = latest
+            val now = SystemClock.elapsedRealtime()
+            if (t.auto != 0 && link.isConnected) {
+                autoOwnsDrive = true
+                if (now - lastTelemetryAt < 500L) {
+                    autopilot.step(t, t.auto, autoMax[t.auto], now)
+                    link.setDrive(autopilot.throttle, autopilot.steer, false)
+                } else {
+                    link.setDrive(0, 0, false)
+                }
+                if (autopilot.gaveUp) {
+                    autopilot.clearGaveUp()
+                    link.sendQueued("A,0,1")
+                }
+            } else if (autoOwnsDrive) {
+                autoOwnsDrive = false
+                pushDrive()
+            }
+            ui.postDelayed(this, 50)
+        }
     }
 
     // ------------------------------------------------------------------ rendering (10 times a second)
@@ -954,15 +1091,26 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         }
     }
 
+    private fun calWhyText(t: Telemetry): String = when (t.calWhy) {
+        1 -> "The motion sensor felt almost no push (${t.runPush} cm/s2). Check the board is fixed firmly to the chassis."
+        2 -> "The car did not cover 2 m in time. Slipping wheels or a weak battery? Try a grippier floor or a charged pack."
+        3 -> String.format(Locale.US, "Speed scale came out odd (%.2f cm/s per %%, expected 0.3 to 2.0). The wheels may have slipped.", t.runK)
+        4 -> "Braking rate came out odd (${t.runDecel} cm/s2, expected 100 to 3000)."
+        5 -> "Safety stop: the wall was closer than 60 cm before the run ended. Start farther back."
+        6 -> "Stopped by throttle, brake, lost link or a flip."
+        7 -> "The stopping distance was too short to measure and the motion sensor did not see the braking."
+        else -> "The result looked odd."
+    }
+
     private fun motionStatus(t: Telemetry, fresh: Boolean): String {
         if (!fresh) return "Not connected"
         return when (t.calState) {
-            1 -> "Running: the car is driving forward..."
-            2 -> "Done. Forward direction and speed learned and saved."
-            3 -> "Failed: no wall found 50 to 400 cm ahead. Move the car and try again."
-            4 -> "Stopped before it finished. Try again."
-            5 -> "The result looked odd. Check the car is on a flat floor and try again."
-            else -> if (t.fwdKnown) "Learned and saved in the car." else "Not learned yet. The car works without it, but motion checks are limited."
+            1 -> "Running: the car drives about 2 m, then brakes hard..."
+            2 -> String.format(Locale.US, "Done. Speed scale %.2f cm/s per %%, braking rate %d cm/s2. Saved in the car.", t.kSpeed, t.brakeDecel)
+            3 -> "No wall found 280 to 400 cm straight ahead (front sonar reads ${cm(t.distC)}). Move the car and try again."
+            4 -> if (t.calWhy != 0) "Stopped: " + calWhyText(t) else "Stopped before it finished. Try again."
+            5 -> "Failed: " + calWhyText(t) + " Details are in Diagnostics."
+            else -> if (t.fwdKnown) "Learned and saved in the car." else "Not learned yet. The car works without it, but traction control, stuck detection and the speed estimate are limited."
         }
     }
 
@@ -1017,6 +1165,8 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             calInfo.text = "Not connected"
         }
         sonarView.setData(t.distC, t.distL, t.distR, fresh)
+        val sonarsOn = if (fresh) t.flags2 and FLAG2_SONAR_ON != 0 else sonarEnabled
+        sonarView.setOff(fresh && !sonarsOn)
 
         // alerts, most urgent first
         val f = t.flags
@@ -1037,9 +1187,14 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             if (f and FLAG_GAVE_UP != 0) add("Auto mode needs help: no safe way forward", 2)
             if (f and FLAG_EMERGENCY != 0) add("Steering for you (push the pad hard the other way to take over)", 1)
             if (f and FLAG_HARD_BRAKE != 0) add("Braking", 1)
+            if (t.flags2 and FLAG2_STEER_AROUND != 0) add("Steering around it", 1)
+            if (t.flags2 and FLAG2_COAST_BRAKE != 0 && f and FLAG_HARD_BRAKE == 0) add("Braking: rolling toward something", 1)
             if (f and FLAG_LIMITED != 0) add("Slowing down: obstacle ahead (limit ${t.cap}%)", 1)
+            if (t.flags2 and FLAG2_SONAR_ON == 0) add("Sonars off: no collision protection", 1)
             if (f and FLAG_LIMP != 0) add("Limp mode: battery low", 1)
             if (f and FLAG_BLOCKED != 0 && f and FLAG_LIMITED == 0) add("Obstacle ahead", 1)
+            if (t.flags2 and FLAG2_TRACTION != 0) add("Traction control", 0)
+            if (t.flags2 and FLAG2_ABS != 0) add("ABS", 0)
             if (f and FLAG_DRIFT != 0) add("Slipping, correcting", 0)
             if (f and FLAG_HILL != 0) add("Hill hold", 0)
             if (f and FLAG_HOLD != 0) add("Cruise on (touch throttle to release)", 0)
@@ -1048,7 +1203,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         alertText.setTextColor(if (!fresh) MUTED else if (danger) BRAKE else if (warn) LIGHT else if (parts.isEmpty()) THROTTLE else ASSIST)
         sonarView.setEdge(
             if (!fresh) 0
-            else if (f and (FLAG_EMERGENCY or FLAG_HARD_BRAKE or FLAG_STUCK) != 0) BRAKE
+            else if (f and (FLAG_EMERGENCY or FLAG_HARD_BRAKE or FLAG_STUCK) != 0 || t.flags2 and FLAG2_COAST_BRAKE != 0) BRAKE
             else if (f and FLAG_LIMITED != 0) LIGHT
             else 0
         )
@@ -1068,6 +1223,15 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         styleChip(lightsChip, lightsOn)
         styleChip(hazardChip, hazardOn)
         for ((c, bit) in assistChips) styleChip(c, assistMask and bit != 0)
+        for ((c, i) in absModeChips) styleChip(c, absModes shr i and 1 != 0)
+        sonarChip.text = if (sonarsOn) "Sonars on" else "Sonars off"
+        styleChip(sonarChip, sonarsOn)
+        val shown = if (fresh) t.mode.coerceIn(0, 2) else tractionShownMode
+        if (shown != tractionShownMode) {
+            tractionShownMode = shown
+            tractionSeek.progress = tractionByMode[shown]
+            tractionLabel.text = tractionText(shown)
+        }
 
         // popup buttons show the current state
         modesBtn.text = if (fresh) "Mode: " + MODE_NAMES.getOrElse(t.mode) { "?" } else "Mode"
@@ -1082,7 +1246,13 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
 
         // motion calibration and diagnostics (only drawn while their popup is open, but cheap)
         motionInfo.text = motionStatus(t, fresh)
-        diagText.text = if (!fresh) "Not connected" else String.format(
+        diagText.text = if (!fresh) "Not connected" else diagnostics(t)
+    }
+
+    private fun diagnostics(t: Telemetry): String {
+        val f = t.flags
+        val sb = StringBuilder()
+        sb.append(String.format(
             Locale.US,
             "Own speed      %4d cm/s\n" +
             "Closing speed  %4d cm/s\n" +
@@ -1090,13 +1260,45 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
             "Slope          %+5.1f deg\n" +
             "Speed limit    %4d %%\n" +
             "Forward known  %s\n" +
+            "Sonars         %s\n" +
             "Sonar C/L/R    %s / %s / %s\n" +
             "G-force        %.1f\n" +
+            "Traction       %s\n" +
+            "ABS            %s\n" +
+            "Speed scale    %.2f cm/s per %%\n" +
+            "Braking rate   %4d cm/s2\n" +
             "Active         %s",
             t.vOwn, t.vClose, t.yawAct, t.yawExp, t.slope, t.cap,
             if (t.fwdKnown) "yes" else "no",
-            cm(t.distC), cm(t.distL), cm(t.distR), t.gForce, flagNames(f)
-        )
+            if (t.flags2 and FLAG2_SONAR_ON != 0) "on" else "OFF",
+            cm(t.distC), cm(t.distL), cm(t.distR), t.gForce,
+            if (t.flags2 and FLAG2_TRACTION != 0) "cutting power" else "idle",
+            if (t.flags2 and FLAG2_ABS != 0) "pulsing" else "idle",
+            t.kSpeed, t.brakeDecel, flagNames(f)
+        ))
+        sb.append("\n\nLast calibration run\n")
+        if (!t.hasRun) {
+            sb.append("none since the car was switched on")
+        } else {
+            sb.append(String.format(
+                Locale.US,
+                "Launch push    %4d cm/s2\n" +
+                "70-190 cm in   %4d ms\n" +
+                "Speed scale    %.2f\n" +
+                "Braking rate   %4d cm/s2\n" +
+                "Braked hard    %4d ms\n" +
+                "Result         %s",
+                t.runPush, t.runMs, t.runK, t.runDecel, t.runBrakeMs,
+                when (t.calState) {
+                    1 -> "running"
+                    2 -> "ok"
+                    3 -> "no wall 280-400 cm"
+                    4, 5 -> "failed, reason ${t.calWhy}"
+                    else -> "-"
+                }
+            ))
+        }
+        return sb.toString()
     }
 
     private fun cm(d: Int): String = if (d >= 900) "clear" else "$d"
@@ -1120,6 +1322,7 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
     private fun syncSettings() {
         val mode = 1
         link.sendQueued("M,$mode")
+        link.sendQueued("Q,${tractionByMode[mode]}")
         link.sendQueued("A,0")
         link.sendQueued("L,${if (lightsOn) 1 else 0}")
         link.sendLatest("B", "B,${brightSeek.progress}")
@@ -1128,6 +1331,9 @@ class MainActivity : Activity(), CarLink.Listener, SensorEventListener {
         link.sendLatest("T", "T,$assistMask")
         link.sendLatest("U", "U,$steerReturn")
         link.sendLatest("J", "J,$gapPct")
+        link.sendLatest("Y", "Y,$absModes")
+        link.sendLatest("O", "O,${if (sonarEnabled) 1 else 0}")
+        for (i in 1..3) link.sendLatest("E$i", "E,$i,${autoMax[i]}")
         pushDrive()
     }
 
