@@ -15,9 +15,9 @@ class Autopilot {
         private const val GO = 0
         private const val BACK = 1
         private const val TURN = 2
-        private const val BACK_PCT = 25f
+        private const val BACK_PCT = 38f
         private const val TURN_PCT = 35f
-        private const val BACK_MS = 450L
+        private const val BACK_MS = 750L
         private const val TURN_MS = 600L
         private const val FOLLOW_TARGET = 30f
         private const val FOLLOW_LOSE = 90f
