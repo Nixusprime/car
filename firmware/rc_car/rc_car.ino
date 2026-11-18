@@ -80,8 +80,8 @@
   flags2: 1 traction control working, 2 ABS pulsing, 4 steering around, 8 sonars on, 16 braking for a roll or push
   calState: 0 idle, 1 running, 2 done, 3 no wall 140-400 cm ahead, 4 aborted, 5 failed (see calWhy)
   calWhy: 1 too little push felt by the accelerometer, 2 did not cover the run in time (wheels slipping or too weak),
-          3 speed scale out of range, 4 braking rate out of range, 5 safety stop (wall under 60 cm),
-          6 stopped by throttle, brake, link loss or flip, 7 stopping distance too short to measure
+          3 speed scale out of range, 4 braking rate too low, 5 safety stop (wall under 35 cm),
+          6 stopped by throttle, brake, link loss or flip, 7 (no longer used: a stop within 3 cm now counts as very hard braking)
 
   START-UP SELF-TEST (headlight flashes): one long flash = all good.
     2 short = IMU not found, 3 short = a sonar saw no echo, 4 short = battery voltage odd.
@@ -942,10 +942,10 @@ void motionCalTick(unsigned long now, float &tgtT, float &tgtS, bool &braking) {
       long tS = (calTpk > calT0) ? (long)(calTpk - calT0) : 0L;
       long stopD = (long)(calD0 - (int)distF(0) - calDs);      // distance covered while braking
       if (tS > 40L && tS < 1500L) decel = vC * 1000L / tS;
-      else if (stopD >= 3L) decel = vC * vC / (2L * stopD);
-      else calWhy = 7;
+      else decel = vC * vC / (2L * (stopD > 3L ? stopD : 3L));  // geared N20s stop almost instantly: "within 3 cm" means at least this hard
       calRdec = (int)decel; calRbrk = (int)tS;
-      if (calWhy == 0 && (decel < 100L || decel > 3000L)) calWhy = 4;
+      if (decel > 3000L) decel = 3000L;
+      if (calWhy == 0 && decel < 100L) calWhy = 4;
     }
     if (calWhy != 0) { calState = (calWhy == 5) ? 4 : 5; return; }
     fwdCos = calMx / mag; fwdSin = calMy / mag; fwdValid = true;
